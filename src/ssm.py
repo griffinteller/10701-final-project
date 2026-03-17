@@ -13,6 +13,8 @@ class Mamba2Config:
     num_heads: int = 16   # H
     state_dim: int = 64  # N
     norm_type: Literal["layer"] | Literal["batch"] = "layer"
+    ssm_mode: Literal["linear", "quadratic", "blocked"] = "quadratic"
+    ssm_block_dim: int = 64
 
 class Mamba2Layer(nn.Module):
     def __init__(self, config: Mamba2Config):
@@ -27,7 +29,7 @@ class Mamba2Layer(nn.Module):
         self.config = config
 
         # B x T x H x C -> B x T x H x 1
-        self.lin_A = MultiheadLinear(num_channels, 1, config.num_heads)
+        self.lin_logA = MultiheadLinear(num_channels, 1, config.num_heads)
 
         channels_XBC = num_channels + 2 * config.state_dim
 
@@ -43,8 +45,6 @@ class Mamba2Layer(nn.Module):
             padding=(config.conv_filter_size - 1, 0),
             groups=channels_XBC * config.num_heads
         )
-
-        self.ssm = SSM()
 
         # B x T x H x C -> B x T x H x C
         self.norm = nn.LayerNorm(normalized_shape=[config.num_heads, num_channels])
@@ -65,12 +65,12 @@ class Mamba2Layer(nn.Module):
         inp = inp.view(size=(B, T, self.config.num_heads, num_channels))
 
         # B x T x H x C -> B x T x H
-        A = self.lin_A(inp).squeeze(-1)
+        logA = self.lin_logA(inp).squeeze(-1)
 
         XBC = F.silu(self.lin_XBC(inp))
         X, B, C = torch.split(XBC, [num_channels, self.config.state_dim, self.config.state_dim], dim=-1)
 
-        Y = self.ssm(A, X, B, C)
+        Y = ssm(logA, X, B, C, mode=self.config.ssm_mode, block_dim=self.config.ssm_block_dim)
 
         Y_gated = self.lin_gate(inp) * Y
         Y_gated_flat = torch.flatten(Y_gated, start_dim=-2)
@@ -92,12 +92,85 @@ class MultiheadLinear(nn.Module):
         """
         return torch.matmul(self.weights, x.unsqueeze(-1)).squeeze(-1) \
             + self.bias
+    
 
-class SSM(nn.Module):
-    def __init__(self):
-        super().__init__()
+def scalar_ss_mat(
+    M: torch.Tensor
+) -> torch.Tensor:
+    M_scan = torch.cumsum(M, dim=-1)
+    M_ss = M_scan[..., :, None] - M_scan[..., None, :]
 
-        pass
+    triu = torch.triu(
+        torch.ones(
+            size=(M.shape[-1], M.shape[-1]), 
+            device=M.device, 
+            dtype=torch.bool), 
+        diagonal=1
+    )
 
-    def forward(self):
-        pass
+    M_ss[..., triu] = -torch.inf
+
+    return M_ss
+
+
+def ssm(
+    logA: torch.Tensor, 
+    X: torch.Tensor, 
+    B: torch.Tensor, 
+    C: torch.Tensor,
+    mode: Literal["linear", "quadratic", "blocked"] = "quadratic",
+    block_dim: int | None = None
+):
+    """
+    inputs
+    ------
+    A : B x T x H
+    X : B x T x H x C
+    B : B x T x H x N
+    C : B x T x H x N
+
+    output
+    ------
+    Y : B x T x H x C
+    """
+
+    B_, T_, H_, C_ = X.shape
+    N_ = B.shape[-1]
+
+    assert logA.shape == (B_, T_, H_)
+    assert B.shape == (B_, T_, H_, N_)
+    assert C.shape == (B_, T_, H_, N_)
+
+    if mode == "linear":
+        # TODO: figure out how to par-scan in linear case
+
+        # B x T x H x C x N
+        XB = torch.matmul(X.unsqueeze(-1), B.unsqueeze(-2))
+
+        # B x H x C x N
+        H = torch.zeros(size=(B_, H_, C_, N_), device=XB.device, dtype=XB.dtype)
+
+        # B x T x H x 1 x 1
+        A = torch.exp(logA).unsqueeze(-1).unsqueeze(-1)
+
+        # B x T x H x C
+        Y = torch.empty_like(X)
+
+        for i in range(T_):
+            H = H * A[:, i] + XB[:, i]
+            Y[:, i] = torch.matmul(H, C[:, i].unsqueeze(-1)).squeeze(-1)
+
+        return Y
+        
+    elif mode == "quadratic":
+        logA = logA.transpose(-1, -2) # B x H x T
+        A_ss = torch.exp(scalar_ss_mat(logA)) # B x H x T x T
+
+        return torch.einsum("bhij,bjhn,bihn,bjhc->bihc", A_ss, B, C, X)
+    
+    elif mode == "blocked":
+        raise NotImplementedError()
+    
+    else:
+        raise ValueError(f"Invalid ssm mode '{mode}'")
+    
