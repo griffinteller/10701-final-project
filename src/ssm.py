@@ -7,14 +7,64 @@ from typing import Literal
 
 
 @dataclass
+class SSMTranslatorConfig:
+    encoder_n_layers: int = 4
+    encoder_d_model: int  = 1024
+    encoder_n_heads: int = 16
+    encoder_d_state: int = 64
+    encoder_vocab_size: int = 20_000
+
+    decoder_n_layers: int = 4
+    decoder_d_model: int  = 1024
+    decoder_n_heads: int = 16
+    decoder_d_state: int = 64
+    decoder_vocab_size: int = 20_000
+
+class SSMTranslator(nn.Module):
+    def __init__(self, config: SSMTranslatorConfig):
+        super().__init__()
+
+        self.E = nn.Embedding(config.encoder_vocab_size, config.encoder_d_model)
+        self.encoder_layers = nn.ModuleList([
+            Mamba2Layer(Mamba2Config(
+                model_dim=config.encoder_d_model,
+                num_heads=config.encoder_n_heads,
+                state_dim=config.encoder_d_state
+            )) for i in range(config.encoder_n_layers)
+        ])
+
+        encoder_hidden_dim = config.encoder_d_model * config.encoder_d_state
+        decoder_hidden_dim = config.decoder_d_model * config.decoder_d_state
+        self.lin_ED = nn.Linear(encoder_hidden_dim, decoder_hidden_dim)
+
+        self.decoder_layers = nn.ModuleList([
+            Mamba2Layer(Mamba2Config(
+                model_dim=config.decoder_d_model,
+                num_heads=config.decoder_n_heads,
+                state_dim=config.decoder_d_state
+            )) for _ in range(config.decoder_n_layers)
+        ])
+
+        self.D = nn.Linear(config.decoder_d_model, config.decoder_vocab_size)
+
+    def forward(self, ids: torch.Tensor, max_output_len: int = 1024) -> torch.Tensor:
+        pass
+
+
+@dataclass
 class Mamba2Config:
     conv_filter_size: int = 4
     model_dim: int = 1024
     num_heads: int = 16   # H
     state_dim: int = 64  # N
-    norm_type: Literal["layer"] | Literal["batch"] = "layer"
-    ssm_mode: Literal["linear", "quadratic", "blocked"] = "quadratic"
-    ssm_block_dim: int = 64
+    disable_output: bool = False
+
+@dataclass 
+class Mamba2LayerResult:
+    Y: torch.Tensor | None
+    H_T: torch.Tensor
+    XBC_cache: torch.Tensor
+
 
 class Mamba2Layer(nn.Module):
     def __init__(self, config: Mamba2Config):
@@ -31,51 +81,104 @@ class Mamba2Layer(nn.Module):
         # B x T x H x C -> B x T x H x 1
         self.lin_logA = MultiheadLinear(num_channels, 1, config.num_heads)
 
-        channels_XBC = num_channels + 2 * config.state_dim
+        if config.disable_output:
+            channels_XBC = num_channels + config.state_dim
+        else:
+            channels_XBC = num_channels + 2 * config.state_dim
 
         # B x T x H x C -> B x T x H x (C + 2N)
+        # or B x T x H x (C + N) if no output (no C)
         self.lin_XBC = MultiheadLinear(num_channels, channels_XBC, config.num_heads)
 
-        self.lin_gate = MultiheadLinear(num_channels, num_channels, config.num_heads)
-
-        # B x T x H(C + 2N) -> B x T x H(C + 2N) (depthwise)
+        # B x H(C + 2N) x T -> B x H(C + 2N) x T (depthwise)
         self.conv = nn.Conv1d(
-            in_channels=channels_XBC * config.num_heads, out_channels=channels_XBC * config.num_heads,
+            in_channels=channels_XBC * config.num_heads, 
+            out_channels=channels_XBC * config.num_heads,
             kernel_size=config.conv_filter_size,
-            padding=(config.conv_filter_size - 1, 0),
             groups=channels_XBC * config.num_heads
         )
 
-        # B x T x H x C -> B x T x H x C
-        self.norm = nn.LayerNorm(normalized_shape=[config.num_heads, num_channels])
+        if not config.disable_output:
+            self.lin_gate = MultiheadLinear(num_channels, num_channels, config.num_heads)
 
-        # B x T X D -> B x T x D
-        self.lin_out = nn.Linear(config.model_dim, config.model_dim)
+            # B x T x D-> B x T x D
+            self.norm = nn.LayerNorm(normalized_shape=[config.model_dim])
 
+            # B x T X D -> B x T x D
+            self.lin_out = nn.Linear(config.model_dim, config.model_dim)
 
-    def forward(self, inp: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, 
+        inp: torch.Tensor, 
+        H_n1: torch.Tensor | None = None,
+        XBC_cache: torch.Tensor | None = None,
+        mode: Literal["linear", "quadratic"] = "quadratic",
+    ) -> Mamba2LayerResult:
         """
         input, output : B x T x D
         """
 
-        B, T = inp.shape[:2]
+        print("---------")
+
+        B_, T_ = inp.shape[:2]
         num_channels = self.config.model_dim // self.config.num_heads
 
         # B x T x D -> B x T x H x C
-        inp = inp.view(size=(B, T, self.config.num_heads, num_channels))
+        inp = inp.view(size=(B_, T_, self.config.num_heads, num_channels))
 
         # B x T x H x C -> B x T x H
         logA = self.lin_logA(inp).squeeze(-1)
 
-        XBC = F.silu(self.lin_XBC(inp))
-        X, B, C = torch.split(XBC, [num_channels, self.config.state_dim, self.config.state_dim], dim=-1)
+        # B x H(C + 2N) x T
+        XBC_unpadded = self.lin_XBC(inp).flatten(start_dim=-2).permute(0, 2, 1)
 
-        Y = ssm(logA, X, B, C, mode=self.config.ssm_mode, block_dim=self.config.ssm_block_dim)
+        if XBC_cache is None:
+            XBC_unconv = F.pad(
+                self.lin_XBC(inp).flatten(start_dim=-2).permute(0, 2, 1), 
+                (self.config.conv_filter_size - 1, 0),
+                "constant",
+                0
+            )
+        else:
+            XBC_unconv = torch.concatenate((XBC_cache, XBC_unpadded), dim=-1)
 
-        Y_gated = self.lin_gate(inp) * Y
+        XBC_cache = XBC_unconv[:, :, -self.config.conv_filter_size:][:, :, 1:]
+
+        XBC_conv = self.conv(XBC_unconv) \
+            .permute(0, 2, 1) \
+            .reshape(B_, T_, self.config.num_heads, -1)
+        
+        XBC = F.silu(XBC_conv)
+        
+        if self.config.disable_output:
+            X, B = torch.split(XBC, [num_channels, self.config.state_dim], dim=-1)
+            C = None
+        else:
+            X, B, C = torch.split(XBC, [num_channels, self.config.state_dim, self.config.state_dim], dim=-1)
+
+        print(f"X: {X}")
+        print(f"B: {B}")
+        print(f"C: {C}")
+
+        if H_n1 is None:
+            H_n1 = torch.zeros(
+                size=(B_, self.config.num_heads, num_channels, self.config.state_dim),
+                device=inp.device
+            )
+
+        print(f"H_n1: {H_n1}")
+
+        Y, H_T = ssm(logA, X, B, C, H_n1, mode=mode, no_Y=self.config.disable_output)
+
+        if self.config.disable_output:
+            return Mamba2LayerResult(None, H_T, XBC_cache)
+
+        Y_gated = F.silu(self.lin_gate(inp)) * Y
         Y_gated_flat = torch.flatten(Y_gated, start_dim=-2)
+        Y_gated_normed = self.norm(Y_gated_flat)
 
-        return self.lin_out(Y_gated_flat)
+        res = self.lin_out(Y_gated_normed)
+        return Mamba2LayerResult(res, H_T, XBC_cache)
 
 
 class MultiheadLinear(nn.Module):
@@ -117,10 +220,11 @@ def ssm(
     logA: torch.Tensor, 
     X: torch.Tensor, 
     B: torch.Tensor, 
-    C: torch.Tensor,
+    C: torch.Tensor | None,
+    H_n1: torch.Tensor,
     mode: Literal["linear", "quadratic", "blocked"] = "quadratic",
-    block_dim: int | None = None
-):
+    no_Y: bool =False
+) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     inputs
     ------
@@ -135,6 +239,7 @@ def ssm(
     """
 
     B_, T_, H_, C_ = X.shape
+    # print(f"T: {T_}")
     N_ = B.shape[-1]
 
     assert logA.shape == (B_, T_, H_)
@@ -148,25 +253,43 @@ def ssm(
         XB = torch.matmul(X.unsqueeze(-1), B.unsqueeze(-2))
 
         # B x H x C x N
-        H = torch.zeros(size=(B_, H_, C_, N_), device=XB.device, dtype=XB.dtype)
+        H = H_n1
 
         # B x T x H x 1 x 1
         A = torch.exp(logA).unsqueeze(-1).unsqueeze(-1)
 
         # B x T x H x C
-        Y = torch.empty_like(X)
+        if not no_Y:
+            Y = torch.empty_like(X)
+        else:
+            Y = None
 
         for i in range(T_):
+            # print(f"A: ", A[:, i])
             H = H * A[:, i] + XB[:, i]
-            Y[:, i] = torch.matmul(H, C[:, i].unsqueeze(-1)).squeeze(-1)
+            # print(f"H_{i}: {H}")
+            if not no_Y:
+                Y[:, i] = torch.matmul(H, C[:, i].unsqueeze(-1)).squeeze(-1)
+                # print(f"Y_{i}: {Y[:, i]}")
 
-        return Y
+        return Y, H
         
     elif mode == "quadratic":
         logA = logA.transpose(-1, -2) # B x H x T
         A_ss = torch.exp(scalar_ss_mat(logA)) # B x H x T x T
+        A_0 = torch.exp(logA[:, :, 0]) # B x H
 
-        return torch.einsum("bhij,bjhn,bihn,bjhc->bihc", A_ss, B, C, X)
+        deltaH = torch.einsum("bhij,bjhn,bjhc->bihcn", A_ss, B, X)
+        baseH = torch.einsum("bh,bht,bhcn->bthcn", A_0, A_ss[:, :, :, 0], H_n1)
+        H = baseH + deltaH
+
+        if not no_Y:
+            # B x T x H x C
+            Y = torch.einsum("bthn,bthcn->bthc", C, H)
+        else:
+            Y = None
+
+        return Y, H[:, -1]
     
     elif mode == "blocked":
         raise NotImplementedError()
