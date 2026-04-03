@@ -145,6 +145,33 @@ class SSMTranslator(nn.Module):
             logits.append(self.D(y).squeeze(1))
 
         return torch.stack(logits, dim=1)
+    
+    def forward(
+        self,
+        inp_ids: torch.Tensor,
+        decode_method: Literal["ag", "forced"] = "ag",
+        forcing_ids: torch.Tensor | None = None,
+        max_output_len: int = 1024,
+        pad_id: int = 0,
+        bos_id: int = 1,
+        eos_id: int = 2,
+    ) -> torch.Tensor:  # logits
+        
+        hs = self.encode(inp_ids)
+
+        if decode_method == "ag":
+            return self.decode_autoregressive(
+                hs, 
+                max_output_len, 
+                pad_id, bos_id, eos_id
+            )
+        
+        elif decode_method == "forced":
+            assert forcing_ids is not None
+            return self.decode_forced(hs, forcing_ids)
+        
+        else:
+            raise RuntimeError(f"Invalid decode method '{decode_method}'")
 
 
 @dataclass

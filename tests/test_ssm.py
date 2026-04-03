@@ -108,15 +108,16 @@ def test_SSM_translator_ag_runs():
     )
 
     translator = SSMTranslator(config)
+    translator.train()
 
-    ids_in = torch.randint(low=0, high=3, size=(2, 7))
+    inp_ids = torch.randint(low=0, high=3, size=(2, 7))
+    
+    logits_out = translator(
+        inp_ids=inp_ids,
+        decode_method="ag"
+    )
 
-    hs = translator.encode(ids_in)
-    for h in hs:
-        h.requires_grad_(True)
-
-    logits_out = translator.decode_autoregressive(hs, max_output_len=16)
-    # print(logits_out.shape)
+    print(logits_out.shape)
 
     s = logits_out.sum()
     s.backward()
@@ -141,12 +142,13 @@ def test_SSM_translator_forced_runs():
     ids_in = torch.randint(low=0, high=3, size=(2, 7))
     ids_target = torch.randint(low=0, high=3, size=(2, 17))
 
-    hs = translator.encode(ids_in)
-    for h in hs:
-        h.requires_grad_(True)
+    logits_out = translator(
+        inp_ids=ids_in,
+        decode_method="forced",
+        forcing_ids=ids_target
+    )
 
-    logits_out = translator.decode_forced(hs, ids_target)
-    # print(logits_out.shape)
+    print(logits_out.shape)
 
     s = logits_out.sum()
     s.backward()
