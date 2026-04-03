@@ -70,7 +70,7 @@ class SSMTranslator(nn.Module):
 
         return hs
     
-    def train_autoregressive(
+    def decode_autoregressive(
         self, 
         hs: list[torch.Tensor], 
         max_output_len: int = 1024, 
@@ -105,12 +105,46 @@ class SSMTranslator(nn.Module):
             lgs = self.D(y).squeeze(1)
             last_id = torch.argmax(lgs, dim=-1)
             last_id[pad_mask] = pad_id
-            # lgs[pad_mask] = torch.zeros_like(lgs[0])
             pad_mask[last_id == eos_id] = True
 
             logits.append(lgs)
 
-        return torch.stack(logits)
+            if pad_mask.all():
+                break
+
+        return torch.stack(logits, dim=1)
+    
+    def decode_forced(
+        self,
+        hs: list[torch.Tensor],
+        inp: torch.Tensor,
+    ) -> torch.Tensor:
+        
+        B = hs[0].shape[0]
+        assert inp.shape[0] == B
+
+        logits = []
+        XBC_caches: list[None | torch.Tensor] = \
+            [None for i in range(len(self.decoder_layers))]
+        
+        for t in range(inp.shape[1]):
+            y = self.E(inp[:, t:t+1])  # B x (T = 1) x D
+
+            for i, (h, cache, decoder) in enumerate(zip(hs, XBC_caches, self.decoder_layers)):
+                result: Mamba2LayerResult = decoder(
+                    inp=y, 
+                    H_n1=h, 
+                    XBC_cache=cache,
+                    mode="linear"
+                )
+
+                y = result.Y + y
+                hs[i] = result.H_T
+                XBC_caches[i] = result.XBC_cache
+
+            logits.append(self.D(y).squeeze(1))
+
+        return torch.stack(logits, dim=1)
 
 
 @dataclass
