@@ -1,7 +1,7 @@
 import pytest
 import torch
 
-from src.ssm import ssm, Mamba2Layer, Mamba2Config
+from src.ssm import SSMTranslator, SSMTranslatorConfig, ssm, Mamba2Layer, Mamba2Config
 
 def test_ssm_equivalence():
     B_, T_, H_, C_, N_ = 2, 3, 4, 5, 6
@@ -91,3 +91,28 @@ def test_H_n1_passsing_mamba_layer():
     assert torch.allclose(result1.Y[:, 0], partial_result.Y[:, 0], atol=1e-6)
     assert torch.allclose(result1.Y[:, 1], result2.Y[:, 0], atol=1e-6)
     assert torch.allclose(result1.H_T, result2.H_T, atol=1e-6)
+
+def test_SSM_translator_ag_runs():
+    config = SSMTranslatorConfig(
+        encoder_n_layers = 3,
+        encoder_d_model = 6,
+        encoder_n_heads = 2,
+        encoder_d_state = 5,
+        encoder_vocab_size=3,
+
+        decoder_n_layers = 3,
+        decoder_d_model = 6,
+        decoder_n_heads = 2,
+        decoder_d_state = 3,
+        decoder_vocab_size=3,
+    )
+
+    translator = SSMTranslator(config)
+
+    ids_in = torch.randint(low=0, high=3, size=(2, 7))
+
+    hs = translator.encode(ids_in)
+    print(hs[1].shape)
+    ids_out = translator.train_autoregressive(hs, max_output_len=16)
+
+    print(ids_out)

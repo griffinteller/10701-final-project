@@ -40,6 +40,10 @@ if __name__ == "__main__":
             model_prefix="en",
             vocab_size=20_000,
             model_type="bpe",
+            pad_id=0,
+            bos_id=1,
+            eos_id=2,
+            unk_id=3
         )
 
         sp.SentencePieceTrainer.Train(
@@ -47,5 +51,9 @@ if __name__ == "__main__":
             model_prefix="fr",
             vocab_size=20_000,
             model_type="bpe",
+            pad_id=0,
+            bos_id=1,
+            eos_id=2,
+            unk_id=3
         )
 

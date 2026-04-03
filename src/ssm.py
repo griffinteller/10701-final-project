@@ -24,18 +24,27 @@ class SSMTranslator(nn.Module):
     def __init__(self, config: SSMTranslatorConfig):
         super().__init__()
 
+        # for now, only support passing hidden states 1-1
+        assert config.decoder_n_layers == config.decoder_d_state
+
         self.E = nn.Embedding(config.encoder_vocab_size, config.encoder_d_model)
         self.encoder_layers = nn.ModuleList([
             Mamba2Layer(Mamba2Config(
                 model_dim=config.encoder_d_model,
                 num_heads=config.encoder_n_heads,
-                state_dim=config.encoder_d_state
+                state_dim=config.encoder_d_state,
+                disable_output=(i == config.encoder_n_layers - 1)
             )) for i in range(config.encoder_n_layers)
         ])
 
         encoder_hidden_dim = config.encoder_d_model * config.encoder_d_state
         decoder_hidden_dim = config.decoder_d_model * config.decoder_d_state
-        self.lin_ED = nn.Linear(encoder_hidden_dim, decoder_hidden_dim)
+
+        # self.lin_EDs = nn.Linear(encoder_hidden_dim, decoder_hidden_dim)
+        self.lin_EDs = nn.ModuleList([
+            nn.Linear(config.encoder_d_state, config.decoder_d_state)
+            for i in range(config.encoder_n_layers)
+        ])
 
         self.decoder_layers = nn.ModuleList([
             Mamba2Layer(Mamba2Config(
@@ -47,8 +56,61 @@ class SSMTranslator(nn.Module):
 
         self.D = nn.Linear(config.decoder_d_model, config.decoder_vocab_size)
 
-    def forward(self, ids: torch.Tensor, max_output_len: int = 1024) -> torch.Tensor:
-        pass
+    def encode(self, ids: torch.Tensor) -> list[torch.Tensor]:
+        y = self.E(ids)
+        hs = []
+        for encoder in self.encoder_layers:
+            result: Mamba2LayerResult = encoder(y)
+            if result.Y is not None:  # skips last layer
+                y = result.Y + y
+            hs.append(result.H_T)
+
+        for i, (h, lin) in enumerate(zip(hs, self.lin_EDs)):
+            hs[i] = lin(h)
+
+        return hs
+    
+    def train_autoregressive(
+        self, 
+        hs: list[torch.Tensor], 
+        max_output_len: int = 1024, 
+        pad_id=0,
+        bos_id=1,
+        eos_id=2,
+    ) -> torch.Tensor:
+        B, _, _, _ = hs[0].shape
+
+        last_id = torch.full((B,), bos_id)
+        logits = []
+        XBC_caches: list[None | torch.Tensor] = \
+            [None for i in range(len(self.decoder_layers))]
+        
+        pad_mask = torch.tensor([False for i in range(B)])
+
+        for t in range(max_output_len):
+            y = self.E(last_id).unsqueeze(1)  # B x (T = 1) x D
+
+            for i, (h, cache, decoder) in enumerate(zip(hs, XBC_caches, self.decoder_layers)):
+                result: Mamba2LayerResult = decoder(
+                    inp=y, 
+                    H_n1=h, 
+                    XBC_cache=cache,
+                    mode="linear"
+                )
+
+                y = result.Y + y
+                hs[i] = result.H_T
+                XBC_caches[i] = result.XBC_cache
+
+            lgs = self.D(y).squeeze(1)
+            last_id = torch.argmax(lgs, dim=-1)
+            last_id[pad_mask] = pad_id
+            # lgs[pad_mask] = torch.zeros_like(lgs[0])
+            pad_mask[last_id == eos_id] = True
+
+            logits.append(lgs)
+
+        return torch.stack(logits)
 
 
 @dataclass
@@ -118,7 +180,7 @@ class Mamba2Layer(nn.Module):
         input, output : B x T x D
         """
 
-        print("---------")
+        # print("---------")
 
         B_, T_ = inp.shape[:2]
         num_channels = self.config.model_dim // self.config.num_heads
@@ -156,9 +218,9 @@ class Mamba2Layer(nn.Module):
         else:
             X, B, C = torch.split(XBC, [num_channels, self.config.state_dim, self.config.state_dim], dim=-1)
 
-        print(f"X: {X}")
-        print(f"B: {B}")
-        print(f"C: {C}")
+        # print(f"X: {X}")
+        # print(f"B: {B}")
+        # print(f"C: {C}")
 
         if H_n1 is None:
             H_n1 = torch.zeros(
@@ -166,7 +228,7 @@ class Mamba2Layer(nn.Module):
                 device=inp.device
             )
 
-        print(f"H_n1: {H_n1}")
+        # print(f"H_n1: {H_n1}")
 
         Y, H_T = ssm(logA, X, B, C, H_n1, mode=mode, no_Y=self.config.disable_output)
 
@@ -244,7 +306,7 @@ def ssm(
 
     assert logA.shape == (B_, T_, H_)
     assert B.shape == (B_, T_, H_, N_)
-    assert C.shape == (B_, T_, H_, N_)
+    assert C is None or C.shape == (B_, T_, H_, N_)
 
     if mode == "linear":
         # TODO: figure out how to par-scan in linear case
