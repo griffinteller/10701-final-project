@@ -6,54 +6,45 @@ import io
 
 
 if __name__ == "__main__":
-    with open(os.path.join(os.path.dirname(__file__), "../data/en-fr.csv")) as f:
-        block_size = 1024
-        num_sentences = 1_000_000
-        
-        def lazy_reader(lang):
-            for i in range((num_sentences // block_size - 1) + 1):
-                lines = []
-                for j in range(block_size):
-                    line = f.readline()
-                    if line == "": break
-                    lines.append(line.strip())
+    num_sentences = 2_000_000
 
-                df = pd.read_csv(io.StringIO("\n".join(lines)))
-                for row in df.itertuples(index=True, name=None):
-                    if lang == "en":
-                        sen = row[1]
-                    elif lang == "fr":
-                        sen = row[2]
-                    else:
-                        raise RuntimeError(f"Invalid language {lang}")
+    print("Loading training data...")
+    df = pd.read_csv(os.path.join(os.path.dirname(__file__), "../data/train.csv"), engine="pyarrow")
 
-                    if not isinstance(sen, str):
-                        continue
+    print("Shuffling data...")
+    df = df.sample(n=num_sentences, random_state=42)
 
-                    yield sen
+    def reader(lang):
+        for row in df.itertuples():
+            if not isinstance(row.en, str) or not isinstance(row.fr, str):
+                continue
+            
+            if lang == "en":
+                yield row.en
+            elif lang == "fr":
+                yield row.fr
 
-                if len(lines) < block_size:
-                    break
+    sp.SentencePieceTrainer.Train(
+        sentence_iterator=reader("en"),
+        model_prefix="en",
+        vocab_size=32_000,  # inline with bert, mamba2 defaults
+        model_type="bpe",
+        pad_id=0,
+        bos_id=1,
+        eos_id=2,
+        unk_id=3,
+        character_coverage=1.0,
+    )
 
-        sp.SentencePieceTrainer.Train(
-            sentence_iterator=lazy_reader("en"),
-            model_prefix="en",
-            vocab_size=20_000,
-            model_type="bpe",
-            pad_id=0,
-            bos_id=1,
-            eos_id=2,
-            unk_id=3
-        )
-
-        sp.SentencePieceTrainer.Train(
-            sentence_iterator=lazy_reader("fr"),
-            model_prefix="fr",
-            vocab_size=20_000,
-            model_type="bpe",
-            pad_id=0,
-            bos_id=1,
-            eos_id=2,
-            unk_id=3
-        )
+    sp.SentencePieceTrainer.Train(
+        sentence_iterator=reader("fr"),
+        model_prefix="fr",
+        vocab_size=32_000,
+        model_type="bpe",
+        pad_id=0,
+        bos_id=1,
+        eos_id=2,
+        unk_id=3,
+        character_coverage=1.0,
+    )
 
