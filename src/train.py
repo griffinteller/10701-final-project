@@ -1,10 +1,18 @@
 import torch
 import numpy as np
 import tqdm
+import argparse
+import pandas as pd
+import os
+import sentencepiece as sp
+import tqdm
+import yaml
+import wandb
 
 from torch import nn
 from dataclasses import dataclass
-from typing import Literal
+from typing import Callable, Literal
+from ssm import SSMTranslator, SSMTranslatorConfig
 
 
 @dataclass
@@ -12,85 +20,344 @@ class TrainResult:
     train_loss: np.ndarray[tuple[int, Literal[2]], np.dtype[np.float32]]
     val_loss: np.ndarray[tuple[int, Literal[2]], np.dtype[np.float32]] | None
 
+@dataclass
+class TrainConfig:
+    lr: int
+    num_epochs: int
+    verbose: bool
+    train_val_split: float
+    batch_size: int
+    data_nrows: int | None
 
 def train(
     model: nn.Module,
-    optimizer: torch.optim.Optimizer,
-    num_epochs: int,
     train_dl: torch.utils.data.DataLoader,
-    val_dl: torch.utils.data.DataLoader | None = None,
-    verbose: bool = False,
-    train_loss_reporting_beta: float = 0.99
-) -> TrainResult:
+    val_dl: torch.utils.data.DataLoader,
+    config: TrainConfig,
+    wandb_run: wandb.Run,
+    example_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = None
+):
     """
     Parameters
     ----------
     model : Module
         Model to train. Should take (input_sequences, target_sequences) and 
-        return vector of loss over batch.
-    optimizer : Optimizer
-        Optimizer to use
+        return mean loss over batch.
     train_dl : DataLoader
         DataLoader for training data. Should return batches input sequences
-        and batches of output sequences, both of token _ids_
-    val_dl : DataLoader, optional
+        and batches of output sequences, both of token _ids_.
+    val_dl : DataLoader
         DataLoader for validation. Validation metrics are collected at the end of 
-        each epoch if provided. Default None.
-    verbose: bool, optional
-        Enable verbose logging. Default False.
-
-    Returns
-    -------
-    TrainResult | None
-        training results, or None if metric_steps = None.
+        each epoch.
+    config : TrainConfig
+        Training config.
+    wandb_run : wandb.Run
+        Wandb run to log metrics and artifacts to.
+    example_fn: Callable[[torch.Tensor, torch.Tensor], None], optional
+        Function called at the beginning of each epoch with a set of input and target ids
+        (a batch of length 1). This can be used to print an example input, target, and output
+        sentence.
     """
 
-    train_losses = []
-    val_losses = [] if val_dl is not None else None 
+    model.train()
 
-    for epoch in range(num_epochs):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
+
+    best_val_loss = None
+    step = 0
+
+    for epoch in range(config.num_epochs):
         print(f"------------ EPOCH {epoch} ------------")
 
-        train_loss_mva = 0
+        # example train and val output
+        if example_fn is not None:
+            model.eval()
+
+            with torch.no_grad():
+                model.eval()
+                for inp, target in train_dl:
+                    example_fn(inp[:1], target[:1])
+                    break
+
+                for inp, target in val_dl:
+                    example_fn(inp[:1], target[:1])
+                    break
+            
+            model.train()
 
         for i, (inp, target) in enumerate(tqdm.tqdm(train_dl)):
-            if verbose:
+            step += 1
+
+            if config.verbose:
                 print(f"====== Batch {i} =======")
 
             optimizer.zero_grad()
 
-            loss = model(inp, target).mean()
+            loss = model(inp, target)
+
             loss.backward()
             optimizer.step()
 
             loss = loss.item()
-            train_losses.append(loss)
+            wandb_run.log({"train_loss": loss}, step=step)
 
-            train_loss_mva = \
-                (train_loss_reporting_beta * train_loss_mva \
-                + (1 - train_loss_reporting_beta) * loss) \
-                / (1 - train_loss_reporting_beta ** (i + 1))
-            
-            if verbose:
+            if config.verbose:
                 print(f"Loss: {loss:.4f}")
-                print(f"Loss MVA: {train_loss_mva:.4f}")
 
-        if val_dl is not None:
-            print(f"======== EVAL =======")
 
-            with torch.no_grad():
-                avg_loss = 0.0
-                for i, (inp, target) in enumerate(tqdm.tqdm(val_dl)):
-                    loss = model(inp, target).mean().item()
-                    avg_loss += (loss - avg_loss) / (i + 1)
+        print(f"======== EVAL =======")
 
-            val_losses.append(avg_loss) # type: ignore
+        with torch.no_grad():
+            avg_loss = 0.0
+            for i, (inp, target) in enumerate(tqdm.tqdm(val_dl)):
+                loss = model(inp, target).item()
+                avg_loss += (loss - avg_loss) / (i + 1)
 
-            print(f"Train Loss MVA: {train_loss_mva:.4f}")
-            print(f"Val Loss: {avg_loss:.4f}")
+        wandb_run.log({"val_loss": avg_loss}, step=step)
 
-    return TrainResult(
-        train_loss=np.array(train_losses),
-        val_loss=np.array(val_losses)
-    )
-        
+        if config.verbose:
+            print(f"Validation loss: {avg_loss:.4f}")
+
+        if best_val_loss is None or avg_loss < best_val_loss:
+            print("Saving new best model...")
+
+            best_val_loss = avg_loss
+
+            os.makedirs("temp/", exist_ok=True)
+            torch.save(model.state_dict(), f"temp/best_model.pt")
+
+            wandb_run.log_artifact("temp/best_model.pt", name=f"{wandb_run.id}_best.pt", type="model")
+
+
+class EnFrTokenizedDataset(torch.utils.data.Dataset):
+    """
+    EN -> FR translation dataset. Yields a tensor of input ids (en) and target ids (fr).
+    Both EN and FR id tensors begin with the `bos_id` of the tokenizer, and end with `sos_id`.
+    """
+
+    def __init__(self, df: pd.DataFrame, tok_en: sp.SentencePieceProcessor, tok_fr: sp.SentencePieceProcessor):
+        self.df = df
+
+        self.proc_en = tok_en
+        self.proc_fr = tok_fr
+
+        self.en_pad_id = tok_en.pad_id()
+        self.fr_pad_id = tok_fr.pad_id()
+
+    def __len__(self):
+        return len(self.df)
+    
+    def __getitem__(self, idx):
+        row = self.df.iloc[idx]
+
+        text_en = row.at["en"]
+        text_fr = row.at["fr"]
+
+        ids_en = self.proc_en.Encode(text_en, add_bos=True, add_eos=True)
+        ids_fr = self.proc_fr.Encode(text_fr, add_bos=True, add_eos=True)
+
+        return torch.tensor(ids_en), torch.tensor(ids_fr)
+    
+    def collate(self, batch: list[tuple[torch.Tensor, torch.Tensor]]) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Collate a batch of token ids into a padded tensor. Left justifies, 
+        and appends `pad_id` to the end of shorter token lists.
+
+        Parameters
+        ------
+        batch: list[tuple[torch.Tensor, torch.Tensor]]
+            list of (en, fr) token id tensors
+
+        Returns
+        -------
+        torch.Tensor, torch.Tensor
+        """
+        en = [x for x, _ in batch]
+        fr = [y for _, y in batch]
+
+        en = nn.utils.rnn.pad_sequence(en, batch_first=True, padding_value=self.en_pad_id)
+        fr = nn.utils.rnn.pad_sequence(fr, batch_first=True, padding_value=self.fr_pad_id)
+
+        return en, fr
+    
+
+class SSMTranslatorTrainer(nn.Module):
+    """
+    Wrapper around SSMTranslator for training. Uses teacher forcing to decode
+    FR sequence, and returns mean cross entropy loss across batches.
+    """
+
+    def __init__(self, ssm_translator: SSMTranslator):
+        super().__init__()
+
+        self.module = ssm_translator
+    
+    def forward(
+        self,
+        inp: torch.Tensor, 
+        target: torch.Tensor,
+        decode_method: Literal["ag", "forced"] = "forced",
+        pad_id: int = 0,
+        bos_id: int = 1,
+        eos_id: int = 2,
+    ) -> torch.Tensor:
+        logits = self.module(
+            inp_ids=inp[:, :-1],
+            decode_method=decode_method,
+            forcing_ids=target[:, 1:],
+            pad_id=pad_id,
+            bos_id=bos_id,
+            eos_id=eos_id
+        )
+
+        return nn.functional.cross_entropy(
+            torch.flatten(logits, end_dim=-2), 
+            torch.flatten(target[:, 1:]),
+            ignore_index=pad_id,
+            reduction="mean"
+        )
+    
+def preprocess(args):
+    """
+    Prepross data. Currently, just shuffles (deterministically) and splits
+    data into train and test sets, then saves to data/train.csv and data/test.csv.
+    """
+
+    import os
+    import sentencepiece as sp
+
+    project_dir = os.path.join(os.path.dirname(__file__), "..")
+
+    print("Reading csv...")
+    df = pd.read_csv(os.path.join(project_dir, "data/en-fr.csv"), engine="pyarrow")
+    nrows = len(df)
+    print(f"nrows: {nrows}")
+
+    print("Shuffling...")
+    df = df.sample(frac=1, random_state=1)
+
+    print("Splitting...")
+    train, test = df.iloc[:int(nrows * 0.9)], df.iloc[int(nrows * 0.9):]
+
+    train.to_csv(os.path.join(project_dir, "data/train.csv"), index=False)
+    test.to_csv(os.path.join(project_dir, "data/test.csv"), index=False)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    subparser = parser.add_subparsers(dest="command")
+
+    preprocess_parser = subparser.add_parser("preprocess")
+
+    train_parser = subparser.add_parser("train")
+    train_parser.add_argument("--train_config", type=str)
+    train_parser.add_argument("--model_config", type=str)
+    train_parser.add_argument("--model", type=str)
+
+    args = parser.parse_args()
+
+
+    if args.command == "preprocess":
+        preprocess(args)
+
+
+    elif args.command == "train":
+        torch.manual_seed(42)
+
+
+        print("Loading training config...")
+        with open(args.train_config) as f:
+            train_config_dict = yaml.safe_load(f)
+
+        train_config = TrainConfig(**train_config_dict)
+
+
+        print("Loading model config...")
+        with open(args.model_config) as f:
+            model_config_dict = yaml.safe_load(f)
+
+
+        print("Creating tokenizers...")
+        tok_en = sp.SentencePieceProcessor()
+        tok_en.Load(os.path.join(os.path.dirname(__file__), "../vocab/en.model"))
+
+        tok_fr = sp.SentencePieceProcessor()
+        tok_fr.Load(os.path.join(os.path.dirname(__file__), "../vocab/fr.model"))
+
+
+        print("Creating model...")
+        if args.model == "ssm":
+            model_config = SSMTranslatorConfig(**model_config_dict)
+            ssm_model = SSMTranslator(model_config)
+            model = SSMTranslatorTrainer(ssm_model)
+
+            def example_fn(inp, target):
+                logits = model.module(
+                    inp_ids=inp[:, :-1],
+                    decode_method="forced",
+                    forcing_ids=target[:, 1:],
+                )
+
+                input_string = tok_en.Decode(inp.tolist())
+                target_string = tok_fr.Decode(target.tolist())
+                output_string = tok_fr.Decode(logits.argmax(dim=-1).tolist())
+
+                print(f"Input string: {input_string}")
+                print(f"Target string: {target_string}")
+                print(f"Output string: {output_string}")
+
+        # --------- Put more models here!! --------
+                
+        else:
+            raise RuntimeError(f"Unknown model type {args.model}")
+
+        total_parameters = sum(param.numel() for param in model.parameters())
+        print(f"Number of parameters: {total_parameters}")
+
+
+        print("Setting up wandb run...")
+        wandb_run = wandb.init(
+            entity="gteller-cmu",
+            project="en-fr-10701",
+            config={
+                "model": args.model,
+                "num_parameters": total_parameters,
+                "train_config": train_config_dict,
+                "model_config": model_config_dict,
+            }
+        )
+
+
+        print("Reading data...")
+        data_path = os.path.join(os.path.dirname(__file__), "../data/train.csv")
+        if train_config.data_nrows is None:
+            df = pd.read_csv(data_path, engine="pyarrow")
+        else:
+            df = pd.read_csv(data_path, nrows=train_config.data_nrows)
+
+
+        print("Creating datasets...")
+        split_idx = int(train_config.train_val_split * len(df))
+        train_dataset = EnFrTokenizedDataset(df.iloc[:split_idx], tok_en, tok_fr)
+        val_dataset = EnFrTokenizedDataset(df.iloc[split_idx:], tok_en, tok_fr)
+
+        print("Creating dataloaders...")
+
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset, 
+            batch_size=train_config.batch_size,
+            shuffle=True,
+            num_workers=2,
+            collate_fn=train_dataset.collate
+        )
+
+        val_dataloader = torch.utils.data.DataLoader(
+            val_dataset, 
+            batch_size=train_config.batch_size,
+            shuffle=True,
+            num_workers=2,
+            collate_fn=val_dataset.collate
+        )
+
+
+        train(model, train_dataloader, val_dataloader, train_config, wandb_run, example_fn=example_fn)

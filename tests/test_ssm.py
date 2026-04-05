@@ -111,10 +111,11 @@ def test_SSM_translator_ag_runs():
     translator.train()
 
     inp_ids = torch.randint(low=0, high=3, size=(2, 7))
-    
+
     logits_out = translator(
         inp_ids=inp_ids,
-        decode_method="ag"
+        decode_method="ag",
+        max_output_len=64,
     )
 
     print(logits_out.shape)
@@ -147,8 +148,6 @@ def test_SSM_translator_forced_runs():
         decode_method="forced",
         forcing_ids=ids_target
     )
-
-    print(logits_out.shape)
 
     s = logits_out.sum()
     s.backward()

@@ -25,7 +25,7 @@ class SSMTranslator(nn.Module):
         super().__init__()
 
         # for now, only support passing hidden states 1-1
-        assert config.decoder_n_layers == config.decoder_d_state
+        assert config.encoder_n_layers == config.decoder_n_layers
 
         self.E = nn.Embedding(config.encoder_vocab_size, config.encoder_d_model)
         self.encoder_layers = nn.ModuleList([
@@ -36,9 +36,6 @@ class SSMTranslator(nn.Module):
                 disable_output=(i == config.encoder_n_layers - 1)
             )) for i in range(config.encoder_n_layers)
         ])
-
-        encoder_hidden_dim = config.encoder_d_model * config.encoder_d_state
-        decoder_hidden_dim = config.decoder_d_model * config.decoder_d_state
 
         # self.lin_EDs = nn.Linear(encoder_hidden_dim, decoder_hidden_dim)
         self.lin_EDs = nn.ModuleList([
@@ -56,11 +53,17 @@ class SSMTranslator(nn.Module):
 
         self.D = nn.Linear(config.decoder_d_model, config.decoder_vocab_size)
 
-    def encode(self, ids: torch.Tensor) -> list[torch.Tensor]:
+    def encode(self, ids: torch.Tensor, pad_id: int = 0) -> list[torch.Tensor]:
+        # find first pad ids
+        first_pad_ids = (ids == pad_id).long().argmax(dim=-1)
+
+        # for any where no pad id, set to batch length
+        first_pad_ids[(ids != pad_id).all(dim=-1)] = ids.shape[1]
+
         y = self.E(ids)
         hs = []
         for encoder in self.encoder_layers:
-            result: Mamba2LayerResult = encoder(y)
+            result: Mamba2LayerResult = encoder(y, batch_lengths=first_pad_ids, mode="quadratic")
             if result.Y is not None:  # skips last layer
                 y = result.Y + y
             hs.append(result.H_T)
@@ -123,28 +126,18 @@ class SSMTranslator(nn.Module):
         B = hs[0].shape[0]
         assert inp.shape[0] == B
 
-        logits = []
-        XBC_caches: list[None | torch.Tensor] = \
-            [None for i in range(len(self.decoder_layers))]
-        
-        for t in range(inp.shape[1]):
-            y = self.E(inp[:, t:t+1])  # B x (T = 1) x D
+        inp = self.E(inp)
 
-            for i, (h, cache, decoder) in enumerate(zip(hs, XBC_caches, self.decoder_layers)):
-                result: Mamba2LayerResult = decoder(
-                    inp=y, 
-                    H_n1=h, 
-                    XBC_cache=cache,
-                    mode="linear"
-                )
+        for decoder in self.decoder_layers:
+            result: Mamba2LayerResult = decoder(
+                inp=inp, 
+                H_n1=hs[0], 
+                XBC_cache=None,
+                mode="quadratic"
+            )
+            inp = result.Y + inp
 
-                y = result.Y + y
-                hs[i] = result.H_T
-                XBC_caches[i] = result.XBC_cache
-
-            logits.append(self.D(y).squeeze(1))
-
-        return torch.stack(logits, dim=1)
+        return self.D(inp)
     
     def forward(
         self,
@@ -236,6 +229,7 @@ class Mamba2Layer(nn.Module):
         H_n1: torch.Tensor | None = None,
         XBC_cache: torch.Tensor | None = None,
         mode: Literal["linear", "quadratic"] = "quadratic",
+        batch_lengths: torch.Tensor | None = None
     ) -> Mamba2LayerResult:
         """
         input, output : B x T x D
@@ -246,11 +240,15 @@ class Mamba2Layer(nn.Module):
         B_, T_ = inp.shape[:2]
         num_channels = self.config.model_dim // self.config.num_heads
 
+        if batch_lengths is None:
+            batch_lengths = torch.full((B_,), T_, dtype=torch.long, device=inp.device)
+
         # B x T x D -> B x T x H x C
         inp = inp.view(size=(B_, T_, self.config.num_heads, num_channels))
 
         # B x T x H x C -> B x T x H
-        logA = self.lin_logA(inp).squeeze(-1)
+        logA = -F.softplus(self.lin_logA(inp).squeeze(-1))
+        # print(f"logA: {logA}")
 
         # B x H(C + 2N) x T
         XBC_unpadded = self.lin_XBC(inp).flatten(start_dim=-2).permute(0, 2, 1)
@@ -291,33 +289,39 @@ class Mamba2Layer(nn.Module):
 
         # print(f"H_n1: {H_n1}")
 
-        Y, H_T = ssm(logA, X, B, C, H_n1, mode=mode, no_Y=self.config.disable_output)
+        Y, H_T = ssm(logA, X, B, C, H_n1, mode=mode, no_Y=self.config.disable_output, batch_lengths=batch_lengths)
+        # print(f"Y: {Y}")
 
         if self.config.disable_output:
             return Mamba2LayerResult(None, H_T, XBC_cache)
 
         Y_gated = F.silu(self.lin_gate(inp)) * Y
+        # print(f"Y_gated: {Y_gated}")
+
         Y_gated_flat = torch.flatten(Y_gated, start_dim=-2)
         Y_gated_normed = self.norm(Y_gated_flat)
 
         res = self.lin_out(Y_gated_normed)
+        # print(res)
         return Mamba2LayerResult(res, H_T, XBC_cache)
 
 
 class MultiheadLinear(nn.Module):
-    def __init__(self, in_channels: int, out_channels: int, num_heads: int):
+    def __init__(self, in_channels: int, out_channels: int, num_heads: int, bias: bool = True):
         super().__init__()
 
         self.weights = nn.Parameter(torch.randn(size=(num_heads, out_channels, in_channels)))
-        self.bias = nn.Parameter(torch.randn(size=(num_heads, out_channels)))
-    
+        self.bias = nn.Parameter(torch.randn(size=(num_heads, out_channels))) if bias else None
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         input : B x num_heads x in_channels
         output : B x num_heads x out_channels
         """
-        return torch.matmul(self.weights, x.unsqueeze(-1)).squeeze(-1) \
-            + self.bias
+        res = torch.matmul(self.weights, x.unsqueeze(-1)).squeeze(-1)
+        if self.bias is not None:
+            res = res + self.bias
+        return res
     
 
 def scalar_ss_mat(
@@ -346,7 +350,8 @@ def ssm(
     C: torch.Tensor | None,
     H_n1: torch.Tensor,
     mode: Literal["linear", "quadratic", "blocked"] = "quadratic",
-    no_Y: bool =False
+    no_Y: bool = False,
+    batch_lengths: torch.Tensor | None = None
 ) -> tuple[torch.Tensor | None, torch.Tensor]:
     """
     inputs
@@ -369,7 +374,12 @@ def ssm(
     assert B.shape == (B_, T_, H_, N_)
     assert C is None or C.shape == (B_, T_, H_, N_)
 
+    if batch_lengths is None:
+        batch_lengths = torch.full((B_,), T_, dtype=torch.long, device=X.device)
+
     if mode == "linear":
+        # raise NotImplementedError("Linear mode currently broken, needs fixing")
+    
         # TODO: figure out how to par-scan in linear case
 
         # B x T x H x C x N
@@ -388,9 +398,11 @@ def ssm(
             Y = None
 
         for i in range(T_):
-            # print(f"A: ", A[:, i])
+            pad_mask = (batch_lengths < i).to(dtype=H.dtype)[:, None, None, None]
+            H_old = H
             H = H * A[:, i] + XB[:, i]
-            # print(f"H_{i}: {H}")
+            H = H * (1.0 - pad_mask) + pad_mask * H_old
+
             if not no_Y:
                 Y[:, i] = torch.matmul(H, C[:, i].unsqueeze(-1)).squeeze(-1)
                 # print(f"Y_{i}: {Y[:, i]}")
@@ -402,9 +414,17 @@ def ssm(
         A_ss = torch.exp(scalar_ss_mat(logA)) # B x H x T x T
         A_0 = torch.exp(logA[:, :, 0]) # B x H
 
+        # print(f"logA: {logA}")
+        # print(f"A_ss: {A_ss}")
+        # print(f"A_0: {A_0}")
+
         deltaH = torch.einsum("bhij,bjhn,bjhc->bihcn", A_ss, B, X)
         baseH = torch.einsum("bh,bht,bhcn->bthcn", A_0, A_ss[:, :, :, 0], H_n1)
         H = baseH + deltaH
+
+        # print(f"deltaH: {deltaH}")
+        # print(f"baseH: {baseH}")
+        # print(f"H: {H}")
 
         if not no_Y:
             # B x T x H x C
@@ -412,7 +432,7 @@ def ssm(
         else:
             Y = None
 
-        return Y, H[:, -1]
+        return Y, H[torch.arange(B_), batch_lengths - 1]
     
     elif mode == "blocked":
         raise NotImplementedError()
