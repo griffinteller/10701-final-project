@@ -8,6 +8,7 @@ import sentencepiece as sp
 import tqdm
 import yaml
 import wandb
+import shutil
 
 from torch import nn
 from dataclasses import dataclass
@@ -28,9 +29,11 @@ class TrainConfig:
     train_val_split: float
     batch_size: int
     data_nrows: int | None
+    seed: int
 
 def train(
     model: nn.Module,
+    optimizer: torch.optim.Optimizer,
     train_dl: torch.utils.data.DataLoader,
     val_dl: torch.utils.data.DataLoader,
     config: TrainConfig,
@@ -61,13 +64,14 @@ def train(
 
     model.train()
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr)
-
     best_val_loss = None
-    step = 0
+    step = wandb_run.step
 
     for epoch in range(config.num_epochs):
         print(f"------------ EPOCH {epoch} ------------")
+
+        # make this deterministic upon resuming from a checkpoint
+        torch.manual_seed(config.seed + epoch + 1)
 
         # example train and val output
         if example_fn is not None:
@@ -125,8 +129,16 @@ def train(
 
             os.makedirs("temp/", exist_ok=True)
             torch.save(model.state_dict(), f"temp/best_model.pt")
+            torch.save(optimizer.state_dict(), f"temp/best_optimizer.pt")
 
-            wandb_run.log_artifact("temp/best_model.pt", name=f"{wandb_run.id}_best.pt", type="model")
+            artifact = wandb.Artifact(artifact_name(wandb_run), type="model")
+            artifact.add_file("temp/best_model.pt")
+            artifact.add_file("temp/best_optimizer.pt")
+
+            wandb_run.log_artifact(artifact)
+
+def artifact_name(wandb_run: wandb.Run) -> str:
+    return f"{wandb_run.id}_best.pt"
 
 
 class EnFrTokenizedDataset(torch.utils.data.Dataset):
@@ -253,6 +265,8 @@ if __name__ == "__main__":
     train_parser.add_argument("--train_config", type=str)
     train_parser.add_argument("--model_config", type=str)
     train_parser.add_argument("--model", type=str)
+    train_parser.add_argument("--run_id", type=str)
+    train_parser.add_argument("--resume", action="store_true")
 
     args = parser.parse_args()
 
@@ -262,14 +276,13 @@ if __name__ == "__main__":
 
 
     elif args.command == "train":
-        torch.manual_seed(42)
-
-
         print("Loading training config...")
         with open(args.train_config) as f:
             train_config_dict = yaml.safe_load(f)
 
         train_config = TrainConfig(**train_config_dict)
+
+        torch.manual_seed(train_config.seed)
 
 
         print("Loading model config...")
@@ -285,11 +298,13 @@ if __name__ == "__main__":
         tok_fr.Load(os.path.join(os.path.dirname(__file__), "../vocab/fr.model"))
 
 
-        print("Creating model...")
+        print("Creating model and optimizer...")
         if args.model == "ssm":
             model_config = SSMTranslatorConfig(**model_config_dict)
             ssm_model = SSMTranslator(model_config)
             model = SSMTranslatorTrainer(ssm_model)
+
+            optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
 
             def example_fn(inp, target):
                 logits = model.module(
@@ -319,6 +334,9 @@ if __name__ == "__main__":
         wandb_run = wandb.init(
             entity="gteller-cmu",
             project="en-fr-10701",
+            id=args.run_id,
+            name=args.run_id,
+            resume="must" if args.resume else "never",
             config={
                 "model": args.model,
                 "num_parameters": total_parameters,
@@ -326,6 +344,22 @@ if __name__ == "__main__":
                 "model_config": model_config_dict,
             }
         )
+
+        if wandb_run.resumed:
+            try:
+                artifact = wandb_run.use_artifact(artifact_name(wandb_run) + ":latest")
+                if os.path.exists("temp/"):
+                    shutil.rmtree("temp/")
+
+                path = artifact.download("temp/")
+                model.load_state_dict(torch.load("temp/best_model.pt"))
+                optimizer.load_state_dict(torch.load("temp/best_optimizer.pt"))
+
+                print("Resumed run from artifact.")
+        
+            except Exception as e:
+                print(f"Error loading artifact: {e}")
+                print("Starting run from scratch...")
 
 
         print("Reading data...")
@@ -340,6 +374,7 @@ if __name__ == "__main__":
         split_idx = int(train_config.train_val_split * len(df))
         train_dataset = EnFrTokenizedDataset(df.iloc[:split_idx], tok_en, tok_fr)
         val_dataset = EnFrTokenizedDataset(df.iloc[split_idx:], tok_en, tok_fr)
+
 
         print("Creating dataloaders...")
 
@@ -360,4 +395,4 @@ if __name__ == "__main__":
         )
 
 
-        train(model, train_dataloader, val_dataloader, train_config, wandb_run, example_fn=example_fn)
+        train(model, optimizer, train_dataloader, val_dataloader, train_config, wandb_run, example_fn=example_fn)

@@ -1,0 +1,8 @@
+---
+lr: 0.01
+num_epochs: 50
+verbose: true
+train_val_split: 0.9
+batch_size: 16
+data_nrows: 1000
+seed: 0
