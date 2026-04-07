@@ -28,14 +28,15 @@ class TrainConfig:
     verbose: bool
     train_val_split: float
     batch_size: int
-    data_nrows: int | None
     seed: int
+    data_nrows: int | None = None
 
 def train(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
     train_dl: torch.utils.data.DataLoader,
     val_dl: torch.utils.data.DataLoader,
+    device: torch.device,
     config: TrainConfig,
     wandb_run: wandb.Run,
     example_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = None
@@ -92,6 +93,9 @@ def train(
         for i, (inp, target) in enumerate(tqdm.tqdm(train_dl)):
             step += 1
 
+            inp = inp.to(device)
+            target = target.to(device)
+
             if config.verbose:
                 print(f"====== Batch {i} =======")
 
@@ -114,6 +118,8 @@ def train(
         with torch.no_grad():
             avg_loss = 0.0
             for i, (inp, target) in enumerate(tqdm.tqdm(val_dl)):
+                inp = inp.to(device)
+                target = target.to(device)
                 loss = model(inp, target).item()
                 avg_loss += (loss - avg_loss) / (i + 1)
 
@@ -284,6 +290,7 @@ if __name__ == "__main__":
 
         torch.manual_seed(train_config.seed)
 
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu")
 
         print("Loading model config...")
         with open(args.model_config) as f:
@@ -361,7 +368,6 @@ if __name__ == "__main__":
                 print(f"Error loading artifact: {e}")
                 print("Starting run from scratch...")
 
-
         print("Reading data...")
         data_path = os.path.join(os.path.dirname(__file__), "../data/train.csv")
         if train_config.data_nrows is None:
@@ -382,17 +388,20 @@ if __name__ == "__main__":
             train_dataset, 
             batch_size=train_config.batch_size,
             shuffle=True,
-            num_workers=2,
-            collate_fn=train_dataset.collate
+            # num_workers=2,
+            collate_fn=train_dataset.collate,
+            pin_memory=True if device.type == "cuda" else False
         )
 
         val_dataloader = torch.utils.data.DataLoader(
             val_dataset, 
             batch_size=train_config.batch_size,
             shuffle=True,
-            num_workers=2,
-            collate_fn=val_dataset.collate
+            # num_workers=2,
+            collate_fn=val_dataset.collate,
+            pin_memory=True if device.type == "cuda" else False
         )
 
+        model.to(device)
 
-        train(model, optimizer, train_dataloader, val_dataloader, train_config, wandb_run, example_fn=example_fn)
+        train(model, optimizer, train_dataloader, val_dataloader, device, train_config, wandb_run, example_fn=example_fn)
