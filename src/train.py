@@ -31,6 +31,7 @@ class TrainConfig:
     train_val_split: float
     batch_size: int
     seed: int
+    eval_steps: int
     data_nrows: int | None = None
 
 def train(
@@ -81,13 +82,12 @@ def train(
             model.eval()
 
             with torch.no_grad():
-                model.eval()
                 for inp, target in train_dl:
-                    example_fn(inp[:1], target[:1])
+                    example_fn(inp[:1].to(device), target[:1].to(device))
                     break
 
                 for inp, target in val_dl:
-                    example_fn(inp[:1], target[:1])
+                    example_fn(inp[:1].to(device), target[:1].to(device))
                     break
             
             model.train()
@@ -114,36 +114,51 @@ def train(
             if config.verbose:
                 print(f"Loss: {loss:.4f}")
 
+            if step % config.eval_steps == 0:
+                print(f"======== EVAL =======")
 
-        print(f"======== EVAL =======")
+                model.eval()
 
-        with torch.no_grad():
-            avg_loss = 0.0
-            for i, (inp, target) in enumerate(tqdm.tqdm(val_dl)):
-                inp = inp.to(device)
-                target = target.to(device)
-                loss = model(inp, target).item()
-                avg_loss += (loss - avg_loss) / (i + 1)
+                # example train and val output
+                if example_fn is not None:
+                    with torch.no_grad():
+                        for inp, target in train_dl:
+                            example_fn(inp[:1].to(device), target[:1].to(device))
+                            break
 
-        wandb_run.log({"val_loss": avg_loss}, step=step)
+                        for inp, target in val_dl:
+                            example_fn(inp[:1].to(device), target[:1].to(device))
+                            break
 
-        if config.verbose:
-            print(f"Validation loss: {avg_loss:.4f}")
+                with torch.no_grad():
+                    avg_loss = 0.0
+                    for i, (inp, target) in enumerate(tqdm.tqdm(val_dl)):
+                        inp = inp.to(device)
+                        target = target.to(device)
+                        loss = model(inp, target).item()
+                        avg_loss += (loss - avg_loss) / (i + 1)
 
-        if best_val_loss is None or avg_loss < best_val_loss:
-            print("Saving new best model...")
+                wandb_run.log({"val_loss": avg_loss}, step=step)
 
-            best_val_loss = avg_loss
+                if config.verbose:
+                    print(f"Validation loss: {avg_loss:.4f}")
 
-            os.makedirs("temp/", exist_ok=True)
-            torch.save(model.state_dict(), f"temp/best_model.pt")
-            torch.save(optimizer.state_dict(), f"temp/best_optimizer.pt")
+                if best_val_loss is None or avg_loss < best_val_loss:
+                    print("Saving new best model...")
 
-            artifact = wandb.Artifact(artifact_name(wandb_run), type="model")
-            artifact.add_file("temp/best_model.pt")
-            artifact.add_file("temp/best_optimizer.pt")
+                    best_val_loss = avg_loss
 
-            wandb_run.log_artifact(artifact)
+                    os.makedirs("temp/", exist_ok=True)
+                    torch.save(model.state_dict(), f"temp/best_model.pt")
+                    torch.save(optimizer.state_dict(), f"temp/best_optimizer.pt")
+
+                    artifact = wandb.Artifact(artifact_name(wandb_run), type="model")
+                    artifact.add_file("temp/best_model.pt")
+                    artifact.add_file("temp/best_optimizer.pt")
+
+                    wandb_run.log_artifact(artifact)
+                
+                model.train()
 
 def artifact_name(wandb_run: wandb.Run) -> str:
     return f"{wandb_run.id}_best.pt"
@@ -383,67 +398,17 @@ if __name__ == "__main__":
             ssm_model = SSMTranslator(model_config)
             model = SSMTranslatorTrainer(ssm_model)
 
-            optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
-
-            def example_fn(inp, target):
-                logits = model.module(
-                    inp_ids=inp[:, :-1],
-                    decode_method="forced",
-                    forcing_ids=target[:, 1:],
-                )
-
-                input_string = tok_en.Decode(inp.tolist())
-                target_string = tok_fr.Decode(target.tolist())
-                output_string = tok_fr.Decode(logits.argmax(dim=-1).tolist())
-
-                print(f"Input string: {input_string}")
-                print(f"Target string: {target_string}")
-                print(f"Output string: {output_string}")
-
         # --------- Put more models here!! --------
         elif args.model == "lstm":
             model_config = LSTMTranslatorConfig(**model_config_dict)
             lstm_model = LSTMTranslator(model_config)
             model = LSTMTranslatorTrainer(lstm_model)
 
-            optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
-
-            def example_fn(inp, target):
-                logits = model.module(
-                    inp_ids=inp[:, :-1],
-                    decode_method="forced",
-                    forcing_ids=target[:, 1:],
-                )
-
-                input_string = tok_en.Decode(inp.tolist())
-                target_string = tok_fr.Decode(target.tolist())
-                output_string = tok_fr.Decode(logits.argmax(dim=-1).tolist())
-
-                print(f"Input string: {input_string}")
-                print(f"Target string: {target_string}")
-                print(f"Output string: {output_string}")
 
         elif args.model == "transformer":
             model_config = TransformerTranslatorConfig(**model_config_dict)
             transformer_model = TransformerTranslator(model_config)
             model = TransformerTranslatorTrainer(transformer_model)
-
-            optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
-
-            def example_fn(inp, target):
-                logits = model.module(
-                    inp_ids=inp[:, :-1],
-                    decode_method="forced",
-                    forcing_ids=target[:, 1:],
-                )
-
-                input_string = tok_en.Decode(inp.tolist())
-                target_string = tok_fr.Decode(target.tolist())
-                output_string = tok_fr.Decode(logits.argmax(dim=-1).tolist())
-
-                print(f"Input string: {input_string}")
-                print(f"Target string: {target_string}")
-                print(f"Output string: {output_string}")
                 
         else:
             raise RuntimeError(f"Unknown model type {args.model}")
@@ -451,6 +416,22 @@ if __name__ == "__main__":
         total_parameters = sum(param.numel() for param in model.parameters())
         print(f"Number of parameters: {total_parameters}")
 
+        optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
+
+        def example_fn(inp, target):
+            logits = model.module(
+                inp_ids=inp[:, :-1],
+                decode_method="forced",
+                forcing_ids=target[:, 1:],
+            )
+
+            input_string = tok_en.Decode(inp.tolist())
+            target_string = tok_fr.Decode(target.tolist())
+            output_string = tok_fr.Decode(logits.argmax(dim=-1).tolist())
+
+            print(f"Input string: {input_string}")
+            print(f"Target string: {target_string}")
+            print(f"Output string: {output_string}")
 
         print("Setting up wandb run...")
         wandb_run = wandb.init(

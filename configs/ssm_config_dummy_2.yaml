@@ -1,12 +1,12 @@
 ---
 encoder_n_layers: 4
 encoder_d_model: 16
-encoder_n_heads: 4
+encoder_n_heads: 2
 encoder_d_state: 4
 encoder_vocab_size: 32000
 
 decoder_n_layers: 4
 decoder_d_model: 16
-decoder_n_heads: 4
+decoder_n_heads: 2
 decoder_d_state: 4
 decoder_vocab_size: 32000
