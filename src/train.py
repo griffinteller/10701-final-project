@@ -14,6 +14,8 @@ from torch import nn
 from dataclasses import dataclass
 from typing import Callable, Literal
 from ssm import SSMTranslator, SSMTranslatorConfig
+from lstm import LSTMTranslator, LSTMTranslatorConfig
+from transformer import TransformerTranslator, TransformerTranslatorConfig
 
 
 @dataclass
@@ -235,9 +237,79 @@ class SSMTranslatorTrainer(nn.Module):
             reduction="mean"
         )
     
+class LSTMTranslatorTrainer(nn.Module):
+    """
+    Wrapper around LSTMTranslator for training. Uses teacher forcing to decode
+    FR sequence, and returns mean cross entropy loss across batches.
+    """
+
+    def __init__(self, lstm_translator: LSTMTranslator):
+        super().__init__()
+        self.module = lstm_translator
+    
+    def forward(
+        self,
+        inp: torch.Tensor, 
+        target: torch.Tensor,
+        decode_method: Literal["ag", "forced"] = "forced",
+        pad_id: int = 0,
+        bos_id: int = 1,
+        eos_id: int = 2,
+    ) -> torch.Tensor:
+        logits = self.module(
+            inp_ids=inp[:, :-1],
+            decode_method=decode_method,
+            forcing_ids=target[:, 1:],
+            pad_id=pad_id,
+            bos_id=bos_id,
+            eos_id=eos_id
+        )
+
+        return nn.functional.cross_entropy(
+            torch.flatten(logits, end_dim=-2), 
+            torch.flatten(target[:, 1:]),
+            ignore_index=pad_id,
+            reduction="mean"
+        )
+    
+class TransformerTranslatorTrainer(nn.Module):
+    """
+    Wrapper around TransformerTranslator for training. Uses teacher forcing to decode
+    FR sequence, and returns mean cross entropy loss across batches.
+    """
+
+    def __init__(self, transformer_translator: TransformerTranslator):
+        super().__init__()
+        self.module = transformer_translator
+    
+    def forward(
+        self,
+        inp: torch.Tensor, 
+        target: torch.Tensor,
+        decode_method: Literal["ag", "forced"] = "forced",
+        pad_id: int = 0,
+        bos_id: int = 1,
+        eos_id: int = 2,
+    ) -> torch.Tensor:
+        logits = self.module(
+            inp_ids=inp[:, :-1],
+            decode_method=decode_method,
+            forcing_ids=target[:, 1:],
+            pad_id=pad_id,
+            bos_id=bos_id,
+            eos_id=eos_id
+        )
+
+        return nn.functional.cross_entropy(
+            torch.flatten(logits, end_dim=-2), 
+            torch.flatten(target[:, 1:]),
+            ignore_index=pad_id,
+            reduction="mean"
+        )
+
 def preprocess(args):
     """
-    Prepross data. Currently, just shuffles (deterministically) and splits
+    Preprocess data. Currently, just shuffles (deterministically) and splits
     data into train and test sets, then saves to data/train.csv and data/test.csv.
     """
 
@@ -329,6 +401,49 @@ if __name__ == "__main__":
                 print(f"Output string: {output_string}")
 
         # --------- Put more models here!! --------
+        elif args.model == "lstm":
+            model_config = LSTMTranslatorConfig(**model_config_dict)
+            lstm_model = LSTMTranslator(model_config)
+            model = LSTMTranslatorTrainer(lstm_model)
+
+            optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
+
+            def example_fn(inp, target):
+                logits = model.module(
+                    inp_ids=inp[:, :-1],
+                    decode_method="forced",
+                    forcing_ids=target[:, 1:],
+                )
+
+                input_string = tok_en.Decode(inp.tolist())
+                target_string = tok_fr.Decode(target.tolist())
+                output_string = tok_fr.Decode(logits.argmax(dim=-1).tolist())
+
+                print(f"Input string: {input_string}")
+                print(f"Target string: {target_string}")
+                print(f"Output string: {output_string}")
+
+        elif args.model == "transformer":
+            model_config = TransformerTranslatorConfig(**model_config_dict)
+            transformer_model = TransformerTranslator(model_config)
+            model = TransformerTranslatorTrainer(transformer_model)
+
+            optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
+
+            def example_fn(inp, target):
+                logits = model.module(
+                    inp_ids=inp[:, :-1],
+                    decode_method="forced",
+                    forcing_ids=target[:, 1:],
+                )
+
+                input_string = tok_en.Decode(inp.tolist())
+                target_string = tok_fr.Decode(target.tolist())
+                output_string = tok_fr.Decode(logits.argmax(dim=-1).tolist())
+
+                print(f"Input string: {input_string}")
+                print(f"Target string: {target_string}")
+                print(f"Output string: {output_string}")
                 
         else:
             raise RuntimeError(f"Unknown model type {args.model}")
