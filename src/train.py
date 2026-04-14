@@ -95,18 +95,24 @@ def train(
         for i, (inp, target) in enumerate(tqdm.tqdm(train_dl)):
             step += 1
 
-            inp = inp.to(device)
-            target = target.to(device)
+            try:
+                inp = inp.to(device)
+                target = target.to(device)
 
-            if config.verbose:
-                print(f"====== Batch {i} =======")
+                if config.verbose:
+                    print(f"====== Batch {i} =======")
 
-            optimizer.zero_grad()
+                optimizer.zero_grad()
 
-            loss = model(inp, target)
+                loss = model(inp, target)
 
-            loss.backward()
-            optimizer.step()
+                loss.backward()
+                optimizer.step()
+            except Exception as e:
+                print(f"Error training batch {i}: {e}")
+                print("Input batch shape:", inp.shape)
+                print("Skipping this batch...")
+                continue
 
             loss = loss.item()
             wandb_run.log({"train_loss": loss}, step=step)
@@ -120,23 +126,31 @@ def train(
                 model.eval()
 
                 # example train and val output
-                if example_fn is not None:
-                    with torch.no_grad():
-                        for inp, target in train_dl:
-                            example_fn(inp[:1].to(device), target[:1].to(device))
-                            break
+                try:
+                    if example_fn is not None:
+                        with torch.no_grad():
+                            for inp, target in train_dl:
+                                example_fn(inp[:1].to(device), target[:1].to(device))
+                                break
 
-                        for inp, target in val_dl:
-                            example_fn(inp[:1].to(device), target[:1].to(device))
-                            break
+                            for inp, target in val_dl:
+                                example_fn(inp[:1].to(device), target[:1].to(device))
+                                break
+                except Exception as e:
+                    print(f"Error in example_fn: {e}")
+                    print("Skipping example_fn for this evaluation step...")
 
                 with torch.no_grad():
                     avg_loss = 0.0
                     for i, (inp, target) in enumerate(tqdm.tqdm(val_dl)):
-                        inp = inp.to(device)
-                        target = target.to(device)
-                        loss = model(inp, target).item()
-                        avg_loss += (loss - avg_loss) / (i + 1)
+                        try:
+                            inp = inp.to(device)
+                            target = target.to(device)
+                            loss = model(inp, target).item()
+                            avg_loss += (loss - avg_loss) / (i + 1)
+                        except Exception as e:
+                            print(f"Error evaluating batch {i}: {e}")
+                            print("Skipping this batch...")
 
                 wandb_run.log({"val_loss": avg_loss}, step=step)
 
