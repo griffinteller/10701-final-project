@@ -1,0 +1,6 @@
+encoder_n_layers: 2
+decoder_n_layers: 2
+embed_dim: 256
+hidden_dim: 512
+encoder_vocab_size: 32000
+decoder_vocab_size: 32000

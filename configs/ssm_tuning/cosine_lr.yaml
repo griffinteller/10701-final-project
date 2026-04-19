@@ -1,0 +1,12 @@
+---
+lr:
+  type: cosine
+  max_lr: 1.0e-3
+  min_lr: 1.0e-4
+  t_max: 3000
+num_epochs: 50
+verbose: true
+train_val_split: 0.99995
+batch_size: 16
+eval_steps: 500
+seed: 0

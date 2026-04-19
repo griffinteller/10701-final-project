@@ -1,0 +1,12 @@
+---
+encoder_n_layers: 10
+encoder_d_model: 768
+encoder_n_heads: 12
+encoder_d_state: 64
+encoder_vocab_size: 32000
+
+decoder_n_layers: 10
+decoder_d_model: 768
+decoder_n_heads: 12
+decoder_d_state: 64
+decoder_vocab_size: 32000

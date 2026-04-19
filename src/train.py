@@ -25,7 +25,7 @@ class TrainResult:
 
 @dataclass
 class TrainConfig:
-    lr: int
+    lr: int | dict
     num_epochs: int
     verbose: bool
     train_val_split: float
@@ -37,6 +37,7 @@ class TrainConfig:
 def train(
     model: nn.Module,
     optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None,
     train_dl: torch.utils.data.DataLoader,
     val_dl: torch.utils.data.DataLoader,
     device: torch.device,
@@ -108,6 +109,10 @@ def train(
 
                 loss.backward()
                 optimizer.step()
+
+                if scheduler is not None:
+                    scheduler.step()
+
             except Exception as e:
                 print(f"Error training batch {i}: {e}")
                 print("Input batch shape:", inp.shape)
@@ -116,6 +121,8 @@ def train(
 
             loss = loss.item()
             wandb_run.log({"train_loss": loss}, step=step)
+            if scheduler is not None:
+                wandb_run.log({"lr": scheduler.get_last_lr()[0]}, step=step)
 
             if config.verbose:
                 print(f"Loss: {loss:.4f}")
@@ -184,11 +191,12 @@ class EnFrTokenizedDataset(torch.utils.data.Dataset):
     Both EN and FR id tensors begin with the `bos_id` of the tokenizer, and end with `sos_id`.
     """
 
-    def __init__(self, df: pd.DataFrame, tok_en: sp.SentencePieceProcessor, tok_fr: sp.SentencePieceProcessor):
+    def __init__(self, df: pd.DataFrame, tok_en: sp.SentencePieceProcessor, tok_fr: sp.SentencePieceProcessor, max_toks: int = 256):
         self.df = df
 
         self.proc_en = tok_en
         self.proc_fr = tok_fr
+        self.max_toks = max_toks
 
         self.en_pad_id = tok_en.pad_id()
         self.fr_pad_id = tok_fr.pad_id()
@@ -221,8 +229,16 @@ class EnFrTokenizedDataset(torch.utils.data.Dataset):
         -------
         torch.Tensor, torch.Tensor
         """
-        en = [x for x, _ in batch]
-        fr = [y for _, y in batch]
+        en_ = [x for x, _ in batch]
+        fr_ = [y for _, y in batch]
+
+        en = [x for i, x in enumerate(en_) if x.shape[0] + fr_[i].shape[0] <= self.max_toks]
+        fr = [y for i, y in enumerate(fr_) if en_[i].shape[0] + y.shape[0] <= self.max_toks]
+
+        if len(en) == 0:
+            print("Warning: all sequences in batch are too long. Returning truncated singleton batch...")
+            en = [en_[0][:self.max_toks // 2]]
+            fr = [fr_[0][:self.max_toks - en_[0].shape[0]]]
 
         en = nn.utils.rnn.pad_sequence(en, batch_first=True, padding_value=self.en_pad_id)
         fr = nn.utils.rnn.pad_sequence(fr, batch_first=True, padding_value=self.fr_pad_id)
@@ -388,6 +404,7 @@ if __name__ == "__main__":
             train_config_dict = yaml.safe_load(f)
 
         train_config = TrainConfig(**train_config_dict)
+        print(train_config)
 
         torch.manual_seed(train_config.seed)
 
@@ -430,7 +447,36 @@ if __name__ == "__main__":
         total_parameters = sum(param.numel() for param in model.parameters())
         print(f"Number of parameters: {total_parameters}")
 
-        optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
+        if isinstance(train_config.lr, int):
+            scheduler = None
+            optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
+        else:
+            if train_config.lr["type"] == "cosine":
+                optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr["max_lr"])
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    eta_min=train_config.lr["min_lr"],
+                    T_max=train_config.lr["t_max"]
+                )
+
+            elif train_config.lr["type"] == "exponential":
+                optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr["max_lr"])
+                scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                    optimizer,
+                    gamma=train_config.lr["gamma"]
+                )
+
+            elif train_config.lr["type"] == "step":
+                optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr["max_lr"])
+                scheduler = torch.optim.lr_scheduler.StepLR(
+                    optimizer,
+                    step_size=train_config.lr["step_size"],
+                    gamma=train_config.lr["gamma"]
+                )
+
+            else:
+                raise RuntimeError(f"Unsupported lr scheduler type {train_config.lr['type']}")
+
 
         def example_fn(inp, target):
             logits = model.module(
@@ -514,4 +560,14 @@ if __name__ == "__main__":
 
         model.to(device)
 
-        train(model, optimizer, train_dataloader, val_dataloader, device, train_config, wandb_run, example_fn=example_fn)
+        train(
+            model, 
+            optimizer, 
+            scheduler, 
+            train_dataloader, 
+            val_dataloader, 
+            device, 
+            train_config, 
+            wandb_run, 
+            example_fn=example_fn
+        )

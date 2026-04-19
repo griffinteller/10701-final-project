@@ -1,0 +1,11 @@
+---
+lr:
+  type: exponential
+  max_lr: 1.0e-3
+  gamma: 0.99847
+num_epochs: 50
+verbose: true
+train_val_split: 0.99995
+batch_size: 16
+eval_steps: 500
+seed: 0
