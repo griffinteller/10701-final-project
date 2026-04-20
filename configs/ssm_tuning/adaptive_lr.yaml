@@ -1,12 +1,12 @@
 ---
 lr:
-  type: step
-  max_lr: 1.0e-3
-  step_size: 1500
-  gamma: 0.1
+  type: adaptive
+  max_lr: 5.0e-4
+  patience: 5
+  factor: 0.1
 num_epochs: 50
 verbose: true
 train_val_split: 0.99995
 batch_size: 16
-eval_steps: 500
+eval_steps: 1000
 seed: 0

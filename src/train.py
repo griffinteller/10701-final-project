@@ -43,7 +43,9 @@ def train(
     device: torch.device,
     config: TrainConfig,
     wandb_run: wandb.Run,
-    example_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = None
+    example_fn: Callable[[torch.Tensor, torch.Tensor], None] | None = None,
+    start_epoch: int = 0,
+    start_step: int = 0,
 ):
     """
     Parameters
@@ -72,14 +74,14 @@ def train(
     best_val_loss = None
     step = wandb_run.step
 
-    for epoch in range(config.num_epochs):
+    for epoch in range(start_epoch,config.num_epochs):
         print(f"------------ EPOCH {epoch} ------------")
 
         # make this deterministic upon resuming from a checkpoint
         torch.manual_seed(config.seed + epoch + 1)
 
         # example train and val output
-        if example_fn is not None:
+        if config.verbose and example_fn is not None:
             model.eval()
 
             with torch.no_grad():
@@ -94,12 +96,12 @@ def train(
             model.train()
 
         train_iter = iter(train_dl)
-        if wandb_run.resumed:
-            print(f"Skipping {step} steps to resume from checkpoint...")
-            for i in tqdm.tqdm(range(step)):
+        if start_step > 0:
+            print(f"Skipping {start_step} steps to resume from checkpoint...")
+            for i in tqdm.tqdm(range(start_step)):
                 next(train_iter)
 
-        for i, (inp, target) in enumerate(tqdm.tqdm(train_iter, initial=step, total=len(train_dl))):
+        for i, (inp, target) in enumerate(tqdm.tqdm(train_iter, initial=start_step, total=len(train_dl))):
             step += 1
 
             try:
@@ -120,10 +122,11 @@ def train(
                     scheduler.step()
 
             except Exception as e:
-                print(f"Error training batch {i}: {e}")
-                print("Input batch shape:", inp.shape)
-                print("Skipping this batch...")
-                continue
+                # print(f"Error training batch {i}: {e}")
+                # print("Input batch shape:", inp.shape)
+                # print("Skipping this batch...")
+                # continue
+                raise e
 
             loss = loss.item()
             wandb_run.log({"train_loss": loss}, step=step)
@@ -182,6 +185,11 @@ def train(
                     artifact = wandb.Artifact(artifact_name(wandb_run), type="model")
                     artifact.add_file("temp/best_model.pt")
                     artifact.add_file("temp/best_optimizer.pt")
+                    artifact.metadata = {
+                        "epoch": epoch,
+                        "step": step,
+                        "wandb_step": wandb_run.step,
+                    }
 
                     wandb_run.log_artifact(artifact)
                 
@@ -442,19 +450,19 @@ if __name__ == "__main__":
         if args.model == "ssm":
             model_config = SSMTranslatorConfig(**model_config_dict)
             ssm_model = SSMTranslator(model_config)
-            model = SSMTranslatorTrainer(ssm_model)
+            model = SSMTranslatorTrainer(ssm_model).to(device)
 
         # --------- Put more models here!! --------
         elif args.model == "lstm":
             model_config = LSTMTranslatorConfig(**model_config_dict)
             lstm_model = LSTMTranslator(model_config)
-            model = LSTMTranslatorTrainer(lstm_model)
+            model = LSTMTranslatorTrainer(lstm_model).to(device)
 
 
         elif args.model == "transformer":
             model_config = TransformerTranslatorConfig(**model_config_dict)
             transformer_model = TransformerTranslator(model_config)
-            model = TransformerTranslatorTrainer(transformer_model)
+            model = TransformerTranslatorTrainer(transformer_model).to(device)
                 
         else:
             raise RuntimeError(f"Unknown model type {args.model}")
@@ -487,6 +495,15 @@ if __name__ == "__main__":
                     optimizer,
                     step_size=train_config.lr["step_size"],
                     gamma=train_config.lr["gamma"]
+                )
+
+            elif train_config.lr["type"] == "adaptive":
+                optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr["max_lr"])
+                scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                    optimizer,
+                    mode="min",
+                    factor=train_config.lr["factor"],
+                    patience=train_config.lr["patience"]
                 )
 
             else:
@@ -523,6 +540,9 @@ if __name__ == "__main__":
             }
         )
 
+        start_epoch = 0
+        start_step = 0
+        start_wandb_step = 0
         if wandb_run.resumed:
             try:
                 artifact = wandb_run.use_artifact(artifact_name(wandb_run) + ":latest")
@@ -530,14 +550,19 @@ if __name__ == "__main__":
                     shutil.rmtree("temp/")
 
                 path = artifact.download("temp/")
-                model.load_state_dict(torch.load("temp/best_model.pt"))
-                optimizer.load_state_dict(torch.load("temp/best_optimizer.pt"))
+                model.load_state_dict(torch.load("temp/best_model.pt", map_location=device))
+                optimizer.load_state_dict(torch.load("temp/best_optimizer.pt", map_location=device))
 
-                print("Resumed run from artifact.")
-        
+                start_epoch = artifact.metadata["epoch"]
+                start_step = artifact.metadata["step"]
+                start_wandb_step = artifact.metadata["wandb_step"]
+            
             except Exception as e:
                 print(f"Error loading artifact: {e}")
-                print("Starting run from scratch...")
+                print("Starting run from beginning...")
+
+            print(f"Resumed run from step {wandb_run.step} (epoch {start_epoch}, step {start_step} in epoch)")
+
 
         print("Reading data...")
         data_path = os.path.join(os.path.dirname(__file__), "../data/train.csv")
@@ -573,8 +598,6 @@ if __name__ == "__main__":
             pin_memory=True if device.type == "cuda" else False
         )
 
-        model.to(device)
-
         train(
             model, 
             optimizer, 
@@ -584,5 +607,7 @@ if __name__ == "__main__":
             device, 
             train_config, 
             wandb_run, 
-            example_fn=example_fn
+            example_fn=example_fn,
+            start_epoch=start_epoch,
+            start_step=start_step
         )
