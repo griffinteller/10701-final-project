@@ -2,7 +2,7 @@
 lr:
   type: exponential
   max_lr: 1.0e-3
-  gamma: 0.99847
+  gamma: 0.99942
 num_epochs: 50
 verbose: true
 train_val_split: 0.99995

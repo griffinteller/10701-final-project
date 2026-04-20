@@ -25,7 +25,7 @@ class TrainResult:
 
 @dataclass
 class TrainConfig:
-    lr: int | dict
+    lr: float | dict
     num_epochs: int
     verbose: bool
     train_val_split: float
@@ -93,7 +93,13 @@ def train(
             
             model.train()
 
-        for i, (inp, target) in enumerate(tqdm.tqdm(train_dl)):
+        train_iter = iter(train_dl)
+        if wandb_run.resumed:
+            print(f"Skipping {step} steps to resume from checkpoint...")
+            for i in tqdm.tqdm(range(step)):
+                next(train_iter)
+
+        for i, (inp, target) in enumerate(tqdm.tqdm(train_iter, initial=step, total=len(train_dl))):
             step += 1
 
             try:
@@ -210,6 +216,11 @@ class EnFrTokenizedDataset(torch.utils.data.Dataset):
         text_en = row.at["en"]
         text_fr = row.at["fr"]
 
+        if not isinstance(text_en, str) or not isinstance(text_fr, str):
+            return \
+                torch.tensor([self.proc_en.bos_id(), self.proc_en.eos_id()]), \
+                torch.tensor([self.proc_fr.bos_id(), self.proc_fr.eos_id()])
+
         ids_en = self.proc_en.Encode(text_en, add_bos=True, add_eos=True)
         ids_fr = self.proc_fr.Encode(text_fr, add_bos=True, add_eos=True)
 
@@ -267,9 +278,9 @@ class SSMTranslatorTrainer(nn.Module):
         eos_id: int = 2,
     ) -> torch.Tensor:
         logits = self.module(
-            inp_ids=inp[:, :-1],
+            inp_ids=inp,
             decode_method=decode_method,
-            forcing_ids=target[:, 1:],
+            forcing_ids=target[:, :-1],
             pad_id=pad_id,
             bos_id=bos_id,
             eos_id=eos_id
@@ -302,9 +313,9 @@ class LSTMTranslatorTrainer(nn.Module):
         eos_id: int = 2,
     ) -> torch.Tensor:
         logits = self.module(
-            inp_ids=inp[:, :-1],
+            inp_ids=inp,
             decode_method=decode_method,
-            forcing_ids=target[:, 1:],
+            forcing_ids=target[:, :-1],
             pad_id=pad_id,
             bos_id=bos_id,
             eos_id=eos_id
@@ -312,7 +323,7 @@ class LSTMTranslatorTrainer(nn.Module):
 
         return nn.functional.cross_entropy(
             torch.flatten(logits, end_dim=-2), 
-            torch.flatten(target[:, 1:]),
+            torch.flatten(target[:, :-1]),
             ignore_index=pad_id,
             reduction="mean"
         )
@@ -337,9 +348,9 @@ class TransformerTranslatorTrainer(nn.Module):
         eos_id: int = 2,
     ) -> torch.Tensor:
         logits = self.module(
-            inp_ids=inp[:, :-1],
+            inp_ids=inp,
             decode_method=decode_method,
-            forcing_ids=target[:, 1:],
+            forcing_ids=target[:, :-1],
             pad_id=pad_id,
             bos_id=bos_id,
             eos_id=eos_id
@@ -379,6 +390,10 @@ def preprocess(args):
 
 
 if __name__ == "__main__":
+    # ensure wandb data doesn't fill up /home device
+    os.environ["WANDB_DATA_DIR"] = "./.wandb_data"
+    os.environ["WANDB_CACHE_DIR"] = "./.wandb_cache"
+
     parser = argparse.ArgumentParser()
     subparser = parser.add_subparsers(dest="command")
 
@@ -447,7 +462,7 @@ if __name__ == "__main__":
         total_parameters = sum(param.numel() for param in model.parameters())
         print(f"Number of parameters: {total_parameters}")
 
-        if isinstance(train_config.lr, int):
+        if isinstance(train_config.lr, float):
             scheduler = None
             optimizer = torch.optim.AdamW(model.parameters(), lr=train_config.lr)
         else:
@@ -480,9 +495,9 @@ if __name__ == "__main__":
 
         def example_fn(inp, target):
             logits = model.module(
-                inp_ids=inp[:, :-1],
+                inp_ids=inp,
                 decode_method="forced",
-                forcing_ids=target[:, 1:],
+                forcing_ids=target[:, :-1],
             )
 
             input_string = tok_en.Decode(inp.tolist())

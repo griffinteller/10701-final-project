@@ -83,12 +83,12 @@ class SSMTranslator(nn.Module):
     ) -> torch.Tensor:
         B, _, _, _ = hs[0].shape
 
-        last_id = torch.full((B,), bos_id)
+        last_id = torch.full((B,), bos_id).to(hs[0].device)
         logits = []
         XBC_caches: list[None | torch.Tensor] = \
             [None for i in range(len(self.decoder_layers))]
         
-        pad_mask = torch.tensor([False for i in range(B)])
+        pad_mask = torch.tensor([False for i in range(B)]).to(hs[0].device)
 
         for t in range(max_output_len):
             y = self.E(last_id).unsqueeze(1)  # B x (T = 1) x D
