@@ -118,15 +118,15 @@ def train(
                 loss.backward()
                 optimizer.step()
 
-                if scheduler is not None:
+                if scheduler is not None \
+                    and not isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
                     scheduler.step()
 
             except Exception as e:
-                # print(f"Error training batch {i}: {e}")
-                # print("Input batch shape:", inp.shape)
-                # print("Skipping this batch...")
-                # continue
-                raise e
+                print(f"Error training batch {i}: {e}")
+                print("Input batch shape:", inp.shape)
+                print("Skipping this batch...")
+                continue
 
             loss = loss.item()
             wandb_run.log({"train_loss": loss}, step=step)
@@ -169,6 +169,9 @@ def train(
                             print("Skipping this batch...")
 
                 wandb_run.log({"val_loss": avg_loss}, step=step)
+
+                if isinstance(scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                    scheduler.step(avg_loss)
 
                 if config.verbose:
                     print(f"Validation loss: {avg_loss:.4f}")
@@ -503,7 +506,7 @@ if __name__ == "__main__":
                     optimizer,
                     mode="min",
                     factor=train_config.lr["factor"],
-                    patience=train_config.lr["patience"]
+                    patience=train_config.lr["patience"],
                 )
 
             else:
