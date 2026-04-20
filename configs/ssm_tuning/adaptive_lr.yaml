@@ -1,7 +1,7 @@
 ---
 lr:
   type: adaptive
-  max_lr: 5.0e-4
+  max_lr: 1.0e-3
   patience: 5
   factor: 0.1
 num_epochs: 50
