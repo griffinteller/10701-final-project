@@ -334,7 +334,7 @@ class LSTMTranslatorTrainer(nn.Module):
 
         return nn.functional.cross_entropy(
             torch.flatten(logits, end_dim=-2), 
-            torch.flatten(target[:, :-1]),
+            torch.flatten(target[:, 1:]),
             ignore_index=pad_id,
             reduction="mean"
         )
@@ -455,7 +455,6 @@ if __name__ == "__main__":
             ssm_model = SSMTranslator(model_config)
             model = SSMTranslatorTrainer(ssm_model).to(device)
 
-        # --------- Put more models here!! --------
         elif args.model == "lstm":
             model_config = LSTMTranslatorConfig(**model_config_dict)
             lstm_model = LSTMTranslator(model_config)
