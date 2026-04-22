@@ -718,21 +718,24 @@ if __name__ == "__main__":
         model.eval()
         results = {}
 
-        for split, dl in [("train", train_dataloader), ("test", test_dataloader)]:
+        for split, dl in [("test", test_dataloader)]:
             references = []
             candidates = []
             printed_examples = 0
 
             print(f"\n{split} BLEU")
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 for inp, target in tqdm.tqdm(dl):
                     inp = inp.to(device)
                     target = target.to(device)
 
+                    max_output_len = min(target.shape[1], 256)
+
                     logits = model.module(
                         inp_ids=inp,
                         decode_method="ag",
+                        max_output_len=max_output_len,
                         pad_id=tok_fr.pad_id(),
                         bos_id=tok_fr.bos_id(),
                         eos_id=tok_fr.eos_id(),
@@ -790,6 +793,83 @@ if __name__ == "__main__":
                         print(f"Pred:   {pred_str}")
 
                         printed_examples += 1
+
+                    del logits, pred_ids, inp, target
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+
+        # for split, dl in [("train", train_dataloader), ("test", test_dataloader)]:
+        #     references = []
+        #     candidates = []
+        #     printed_examples = 0
+
+        #     print(f"\n{split} BLEU")
+
+        #     with torch.no_grad():
+        #         for inp, target in tqdm.tqdm(dl):
+        #             inp = inp.to(device)
+        #             target = target.to(device)
+
+        #             logits = model.module(
+        #                 inp_ids=inp,
+        #                 decode_method="ag",
+        #                 pad_id=tok_fr.pad_id(),
+        #                 bos_id=tok_fr.bos_id(),
+        #                 eos_id=tok_fr.eos_id(),
+        #             )
+
+        #             pred_ids = logits.argmax(dim=-1)
+
+        #             for ref, cand in zip(target.tolist(), pred_ids.tolist()):
+        #                 ref = strip_special(
+        #                     ref,
+        #                     pad_id=tok_fr.pad_id(),
+        #                     bos_id=tok_fr.bos_id(),
+        #                     eos_id=tok_fr.eos_id(),
+        #                 )
+        #                 cand = strip_special(
+        #                     cand,
+        #                     pad_id=tok_fr.pad_id(),
+        #                     bos_id=tok_fr.bos_id(),
+        #                     eos_id=tok_fr.eos_id(),
+        #                 )
+
+        #                 ref_tokens = tok_fr.Decode(ref).split()
+        #                 cand_tokens = tok_fr.Decode(cand).split()
+
+        #                 references.append([ref_tokens])
+        #                 candidates.append(cand_tokens)
+
+        #             if printed_examples < args.num_examples:
+        #                 inp_ids = strip_special(
+        #                     inp[0].tolist(),
+        #                     pad_id=tok_en.pad_id(),
+        #                     bos_id=tok_en.bos_id(),
+        #                     eos_id=tok_en.eos_id(),
+        #                 )
+        #                 target_ids = strip_special(
+        #                     target[0].tolist(),
+        #                     pad_id=tok_fr.pad_id(),
+        #                     bos_id=tok_fr.bos_id(),
+        #                     eos_id=tok_fr.eos_id(),
+        #                 )
+        #                 pred_ids_0 = strip_special(
+        #                     pred_ids[0].tolist(),
+        #                     pad_id=tok_fr.pad_id(),
+        #                     bos_id=tok_fr.bos_id(),
+        #                     eos_id=tok_fr.eos_id(),
+        #                 )
+
+        #                 inp_str = tok_en.Decode(inp_ids)
+        #                 target_str = tok_fr.Decode(target_ids)
+        #                 pred_str = tok_fr.Decode(pred_ids_0)
+
+        #                 print(f"\nExample:")
+        #                 print(f"Input:  {inp_str}")
+        #                 print(f"Target: {target_str}")
+        #                 print(f"Pred:   {pred_str}")
+
+        #                 printed_examples += 1
 
             score = sacrebleu.corpus_bleu(candidates, [references]).score
             print(f"\n{split} BLEU: {score:.2f}")
