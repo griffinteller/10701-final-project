@@ -9,6 +9,8 @@ import tqdm
 import yaml
 import wandb
 import shutil
+import time
+import statistics
 
 from torch import nn
 from dataclasses import dataclass
@@ -436,6 +438,13 @@ if __name__ == "__main__":
     eval_parser.add_argument("--data_nrows", type=int, default=None)
     eval_parser.add_argument("--num_examples", type=int, default=1)
 
+    eval_parser.add_argument("--run_benchmark", action="store_true")
+    eval_parser.add_argument("--benchmark_prompt_len", type=int, default=128)
+    eval_parser.add_argument("--benchmark_gen_len", type=int, default=64)
+    eval_parser.add_argument("--benchmark_batch_sizes", type=int, nargs="+", default=[1, 2, 4, 8, 16, 32])
+    eval_parser.add_argument("--benchmark_repeats", type=int, default=3)
+    eval_parser.add_argument("--benchmark_warmup", type=int, default=2)
+
     args = parser.parse_args()
 
 
@@ -699,7 +708,123 @@ if __name__ == "__main__":
 
         artifact.download("temp/")
         model.load_state_dict(torch.load("temp/best_model.pt", map_location=device))
-        model.eval()
+        base_model = model.module
+        base_model.eval()
+
+        def sync_device(device):
+            if device.type == "cuda":
+                torch.cuda.synchronize()
+            elif device.type == "mps":
+                torch.mps.synchronize()
+
+        def time_forward_pass(fn, device, warmup=5, repeats=10):
+            with torch.inference_mode():
+                for _ in range(warmup):
+                    _ = fn()
+                sync_device(device)
+
+            times = []
+            with torch.inference_mode():
+                for _ in range(repeats):
+                    sync_device(device)
+                    t0 = time.perf_counter()
+                    _ = fn()
+                    sync_device(device)
+                    t1 = time.perf_counter()
+                    times.append(t1 - t0)
+
+            return statistics.median(times)
+
+        @torch.inference_mode()
+        def run_throughput_benchmark(
+            model,
+            model_config,
+            tok_fr,
+            device,
+            prompt_len,
+            gen_len,
+            batch_sizes,
+            repeats,
+            warmup,
+        ):
+            """
+            Basic throughput benchmarking. Fixes prompt length + generation length,
+            varies batch size and measures throughput (tokens generated/sec)
+            """
+            model.eval()
+            results = []
+
+            for bs in batch_sizes:
+                inp = torch.randint(
+                    low=3,
+                    high=model_config.encoder_vocab_size,
+                    size=(bs, prompt_len),
+                    dtype=torch.long,
+                    device=device,
+                )
+
+                def fn():
+                    return base_model(
+                        inp_ids=inp,
+                        decode_method="ag",
+                        max_output_len=gen_len,
+                        pad_id=tok_fr.pad_id(),
+                        bos_id=tok_fr.bos_id(),
+                        eos_id=-1,
+                    )
+
+                try:
+                    avg_time = time_forward_pass(
+                        fn,
+                        device=device,
+                        warmup=warmup,
+                        repeats=repeats,
+                    )
+
+                    # sample_out = fn()
+                    # print(bs, sample_out.shape)
+                    toks_per_sec = (bs * gen_len)/avg_time
+
+                    row = {
+                        "batch_size": bs,
+                        "avg_time_sec": avg_time,
+                        "tokens_per_sec": toks_per_sec,
+                    }
+                    results.append(row)
+
+                    print(
+                        f"[benchmark] bs={bs} | "
+                        f"time={avg_time:.4f}s | "
+                        f"throughput={toks_per_sec:.2f} tok/s"
+                    )
+
+                except RuntimeError as e:
+                    if "out of memory" in str(e).lower():
+                        print(f"bs={bs}, out of memory")
+                    else:
+                        raise
+
+            return results
+
+        if args.run_benchmark:
+            print("\nRunning inference throughput benchmark...")
+            benchmark_results = run_throughput_benchmark(
+                model=model,
+                model_config=model_config,
+                tok_fr=tok_fr,
+                device=device,
+                prompt_len=args.benchmark_prompt_len,
+                gen_len=args.benchmark_gen_len,
+                batch_sizes=args.benchmark_batch_sizes,
+                repeats=args.benchmark_repeats,
+                warmup=args.benchmark_warmup,
+            )
+
+            for row in benchmark_results:
+                bs = row["batch_size"]
+                if row["tokens_per_sec"] is not None:
+                    wandb_run.summary[f"benchmark_bs_{bs}_tok_per_s"] = row["tokens_per_sec"]
+                    wandb_run.summary[f"benchmark_bs_{bs}_avg_sec"] = row["avg_time_sec"]
 
         print("Reading data...")
         train_path = os.path.join(os.path.dirname(__file__), "../data/train.csv")
@@ -831,12 +956,8 @@ if __name__ == "__main__":
                         torch.cuda.empty_cache()
 
             score = sacrebleu.corpus_bleu(candidates, [references]).score
-            print(f"\n{split} BLEU: {score:.2f}")
+            print(f"\n{split} BLEU: {score:.4f}")
             results[split] = score
             wandb_run.summary[f"{split}_bleu"] = score
-
-        # print("\nEval Results:")
-        # for split, score in results.items():
-        #     print(f"\n{split} BLEU {score:.2f}")
 
         wandb_run.finish()
