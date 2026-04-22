@@ -691,8 +691,8 @@ if __name__ == "__main__":
             train_df = pd.read_csv(train_path, engine="pyarrow")
             test_df = pd.read_csv(test_path, engine="pyarrow")
         else:
-            train_df = pd.read_csv(train_path, engine="pyarrow", nrows=args.data_nrows)
-            test_df = pd.read_csv(test_path, engine="pyarrow", nrows=args.data_nrows)
+            train_df = pd.read_csv(train_path, nrows=args.data_nrows)
+            test_df = pd.read_csv(test_path, nrows=args.data_nrows)
 
         print("Creating datasets...")
         train_dataset = EnFrTokenizedDataset(train_df, tok_en, tok_fr)
