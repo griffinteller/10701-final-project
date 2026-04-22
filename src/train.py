@@ -13,6 +13,7 @@ import shutil
 from torch import nn
 from dataclasses import dataclass
 from typing import Callable, Literal
+from torchtext.data.metrics import bleu_score
 from ssm import SSMTranslator, SSMTranslatorConfig
 from lstm import LSTMTranslator, LSTMTranslatorConfig
 from transformer import TransformerTranslator, TransformerTranslatorConfig
@@ -399,6 +400,15 @@ def preprocess(args):
     train.to_csv(os.path.join(project_dir, "data/train.csv"), index=False)
     test.to_csv(os.path.join(project_dir, "data/test.csv"), index=False)
 
+def strip_special(ids, pad_id=0, bos_id=1, eos_id=2):
+    out = []
+    for t in ids:
+        if t == bos_id or t == pad_id:
+            continue
+        if t == eos_id:
+            break
+        out.append(t)
+    return out
 
 if __name__ == "__main__":
     # ensure wandb data doesn't fill up /home device
@@ -416,6 +426,14 @@ if __name__ == "__main__":
     train_parser.add_argument("--model", type=str)
     train_parser.add_argument("--run_id", type=str)
     train_parser.add_argument("--resume", action="store_true")
+
+    eval_parser = subparser.add_parser("evaluate")
+    eval_parser.add_argument("--model_config", type=str)
+    eval_parser.add_argument("--model", type=str)
+    eval_parser.add_argument("--run_id", type=str)
+    eval_parser.add_argument("--batch_size", type=int, default=32)
+    eval_parser.add_argument("--data_nrows", type=int, default=None)
+    eval_parser.add_argument("--num_examples", type=int, default=1)
 
     args = parser.parse_args()
 
@@ -613,3 +631,175 @@ if __name__ == "__main__":
             start_epoch=start_epoch,
             start_step=start_step
         )
+
+    elif args.command == "evaluate":
+        device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.mps.is_available() else "cpu")
+
+        print("Loading model config...")
+        with open(args.model_config) as f:
+            model_config_dict = yaml.safe_load(f)
+
+        print("Creating tokenizers...")
+        tok_en = sp.SentencePieceProcessor()
+        tok_en.Load(os.path.join(os.path.dirname(__file__), "../vocab/en.model"))
+
+        tok_fr = sp.SentencePieceProcessor()
+        tok_fr.Load(os.path.join(os.path.dirname(__file__), "../vocab/fr.model"))
+
+        print("Creating model...")
+        if args.model == "ssm":
+            model_config = SSMTranslatorConfig(**model_config_dict)
+            base_model = SSMTranslator(model_config)
+            model = SSMTranslatorTrainer(base_model).to(device)
+
+        elif args.model == "lstm":
+            model_config = LSTMTranslatorConfig(**model_config_dict)
+            base_model = LSTMTranslator(model_config)
+            model = LSTMTranslatorTrainer(base_model).to(device)
+
+        elif args.model == "transformer":
+            model_config = TransformerTranslatorConfig(**model_config_dict)
+            base_model = TransformerTranslator(model_config)
+            model = TransformerTranslatorTrainer(base_model).to(device)
+
+        else:
+            raise RuntimeError(f"Unknown model type {args.model}")
+
+        print("Loading artifact...")
+        wandb_run = wandb.init(
+            entity="gteller-cmu",
+            project="en-fr-10701",
+            id=args.run_id,
+            name=args.run_id,
+            resume="must",
+        )
+        artifact = wandb_run.use_artifact(artifact_name(wandb_run) + ":latest")
+
+        if os.path.exists("temp/"):
+            shutil.rmtree("temp/")
+        os.makedirs("temp/", exist_ok=True)
+
+        artifact.download("temp/")
+        model.load_state_dict(torch.load("temp/best_model.pt", map_location=device))
+        model.eval()
+
+        print("Reading data...")
+        train_path = os.path.join(os.path.dirname(__file__), "../data/train.csv")
+        test_path = os.path.join(os.path.dirname(__file__), "../data/test.csv")
+
+        if args.data_nrows is None:
+            train_df = pd.read_csv(train_path, engine="pyarrow")
+            test_df = pd.read_csv(test_path, engine="pyarrow")
+        else:
+            train_df = pd.read_csv(train_path, engine="pyarrow", nrows=args.data_nrows)
+            test_df = pd.read_csv(test_path, engine="pyarrow", nrows=args.data_nrows)
+
+        print("Creating datasets...")
+        train_dataset = EnFrTokenizedDataset(train_df, tok_en, tok_fr)
+        test_dataset = EnFrTokenizedDataset(test_df, tok_en, tok_fr)
+
+        print("Creating dataloaders...")
+        train_dataloader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=train_dataset.collate,
+            pin_memory=True if device.type == "cuda" else False
+        )
+
+        test_dataloader = torch.utils.data.DataLoader(
+            test_dataset,
+            batch_size=args.batch_size,
+            shuffle=False,
+            collate_fn=test_dataset.collate,
+            pin_memory=True if device.type == "cuda" else False
+        )
+
+        model.eval()
+        results = {}
+
+        for split, dl in [("train", train_dataloader), ("test", test_dataloader)]:
+            references = []
+            candidates = []
+            printed_examples = 0
+
+            print(f"\n{split} BLEU")
+
+            with torch.no_grad():
+                for inp, target in tqdm.tqdm(dl):
+                    inp = inp.to(device)
+                    target = target.to(device)
+
+                    logits = model.module(
+                        inp_ids=inp,
+                        decode_method="ag",
+                        pad_id=tok_fr.pad_id(),
+                        bos_id=tok_fr.bos_id(),
+                        eos_id=tok_fr.eos_id(),
+                    )
+
+                    pred_ids = logits.argmax(dim=-1)
+
+                    for ref, cand in zip(target.tolist(), pred_ids.tolist()):
+                        ref = strip_special(
+                            ref,
+                            pad_id=tok_fr.pad_id(),
+                            bos_id=tok_fr.bos_id(),
+                            eos_id=tok_fr.eos_id(),
+                        )
+                        cand = strip_special(
+                            cand,
+                            pad_id=tok_fr.pad_id(),
+                            bos_id=tok_fr.bos_id(),
+                            eos_id=tok_fr.eos_id(),
+                        )
+
+                        ref_tokens = tok_fr.Decode(ref).split()
+                        cand_tokens = tok_fr.Decode(cand).split()
+
+                        references.append([ref_tokens])
+                        candidates.append(cand_tokens)
+
+                    if printed_examples < args.num_examples:
+                        inp_ids = strip_special(
+                            inp[0].tolist(),
+                            pad_id=tok_en.pad_id(),
+                            bos_id=tok_en.bos_id(),
+                            eos_id=tok_en.eos_id(),
+                        )
+                        target_ids = strip_special(
+                            target[0].tolist(),
+                            pad_id=tok_fr.pad_id(),
+                            bos_id=tok_fr.bos_id(),
+                            eos_id=tok_fr.eos_id(),
+                        )
+                        pred_ids_0 = strip_special(
+                            pred_ids[0].tolist(),
+                            pad_id=tok_fr.pad_id(),
+                            bos_id=tok_fr.bos_id(),
+                            eos_id=tok_fr.eos_id(),
+                        )
+
+                        inp_str = tok_en.Decode(inp_ids)
+                        target_str = tok_fr.Decode(target_ids)
+                        pred_str = tok_fr.Decode(pred_ids_0)
+
+                        print(f"\nExample:")
+                        print(f"Input:  {inp_str}")
+                        print(f"Target: {target_str}")
+                        print(f"Pred:   {pred_str}")
+
+                        printed_examples += 1
+
+            score = bleu_score(candidates, references)
+            print(f"\n{split} BLEU: {score:.4f}")
+            results[split] = score
+
+            wandb_run.summary[f"{split}_bleu"] = score
+
+        print("\nEval Results:")
+
+        for split, score in results.items():
+            print(f"\n{split} BLEU {score:.4f}")
+
+        wandb_run.finish()
