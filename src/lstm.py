@@ -64,10 +64,11 @@ class LSTMTranslator(nn.Module):
                             eos_id=2):
         hidden, cell = hs
         B = hidden.shape[1]
+        device = hidden.device
 
-        last_id = torch.full((B,), bos_id)
+        last_id = torch.full((B,), bos_id, device=device)
         logits_out = []
-        pad_mask = torch.tensor([False for i in range(B)])
+        pad_mask = torch.tensor([False for i in range(B)], device=device)
 
         for t in range(max_output_len):
             cur_ids = last_id.unsqueeze(1)
