@@ -13,7 +13,7 @@ import shutil
 from torch import nn
 from dataclasses import dataclass
 from typing import Callable, Literal
-from torchtext.data.metrics import bleu_score
+import sacrebleu
 from ssm import SSMTranslator, SSMTranslatorConfig
 from lstm import LSTMTranslator, LSTMTranslatorConfig
 from transformer import TransformerTranslator, TransformerTranslatorConfig
@@ -791,15 +791,14 @@ if __name__ == "__main__":
 
                         printed_examples += 1
 
-            score = bleu_score(candidates, references)
-            print(f"\n{split} BLEU: {score:.4f}")
+            score = sacrebleu.corpus_bleu(candidates, [references]).score
+            print(f"\n{split} BLEU: {score:.2f}")
             results[split] = score
 
             wandb_run.summary[f"{split}_bleu"] = score
 
         print("\nEval Results:")
-
         for split, score in results.items():
-            print(f"\n{split} BLEU {score:.4f}")
+            print(f"\n{split} BLEU {score:.2f}")
 
         wandb_run.finish()
