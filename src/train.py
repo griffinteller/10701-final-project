@@ -757,11 +757,11 @@ if __name__ == "__main__":
                             eos_id=tok_fr.eos_id(),
                         )
 
-                        ref_tokens = tok_fr.Decode(ref).split()
-                        cand_tokens = tok_fr.Decode(cand).split()
+                        ref_txt = tok_fr.Decode(ref)
+                        cand_txt = tok_fr.Decode(cand)
 
-                        references.append([ref_tokens])
-                        candidates.append(cand_tokens)
+                        references.append([ref_txt])
+                        candidates.append(cand_txt)
 
                     if printed_examples < args.num_examples:
                         inp_ids = strip_special(
