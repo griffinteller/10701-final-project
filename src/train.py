@@ -416,6 +416,7 @@ if __name__ == "__main__":
     train_parser.add_argument("--model", type=str)
     train_parser.add_argument("--run_id", type=str)
     train_parser.add_argument("--resume", action="store_true")
+    train_parser.add_argument("--start_from", type=str, default=None)
 
     args = parser.parse_args()
 
@@ -542,6 +543,9 @@ if __name__ == "__main__":
             }
         )
 
+        assert not (args.resume and args.start_from is not None), \
+            "Cannot specify both --resume and --start_from"
+
         start_epoch = 0
         start_step = 0
         start_wandb_step = 0
@@ -565,6 +569,20 @@ if __name__ == "__main__":
 
             print(f"Resumed run from step {wandb_run.step} (epoch {start_epoch}, step {start_step} in epoch)")
 
+        if args.start_from is not None:
+            print(f"Loading artifact from {args.start_from}...")
+
+            artifact = wandb_run.use_artifact(args.start_from)
+            if os.path.exists("temp/"):
+                shutil.rmtree("temp/")
+
+            path = artifact.download("temp/")
+            model.load_state_dict(torch.load("temp/best_model.pt", map_location=device))
+            optimizer.load_state_dict(torch.load("temp/best_optimizer.pt", map_location=device))
+
+            start_epoch = artifact.metadata["epoch"]
+            start_step = artifact.metadata["step"]
+            start_wandb_step = artifact.metadata["wandb_step"]
 
         print("Reading data...")
         data_path = os.path.join(os.path.dirname(__file__), "../data/train.csv")

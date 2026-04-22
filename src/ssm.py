@@ -90,6 +90,9 @@ class SSMTranslator(nn.Module):
         
         pad_mask = torch.tensor([False for i in range(B)]).to(hs[0].device)
 
+        # match bug in teacher forcing
+        hs = [hs[0] for _ in range(len(self.decoder_layers))]
+
         for t in range(max_output_len):
             y = self.E(last_id).unsqueeze(1)  # B x (T = 1) x D
 
