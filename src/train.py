@@ -717,6 +717,15 @@ if __name__ == "__main__":
             elif device.type == "mps":
                 torch.mps.synchronize()
 
+    def reset_peak_memory(device):
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
+
+    def get_peak_memory_mb(device):
+        if device.type == "cuda":
+            return torch.cuda.max_memory_allocated() / (1024 ** 2)
+        return None
+
         def time_forward_pass(fn, device, warmup=5, repeats=10):
             with torch.inference_mode():
                 for _ in range(warmup):
@@ -774,6 +783,7 @@ if __name__ == "__main__":
                     )
 
                 try:
+                    reset_peak_memory(device)
                     avg_time = time_forward_pass(
                         fn,
                         device=device,
@@ -781,6 +791,7 @@ if __name__ == "__main__":
                         repeats=repeats,
                     )
 
+                    peak_mem = get_peak_memory_mb(device)
                     # sample_out = fn()
                     # print(bs, sample_out.shape)
                     toks_per_sec = (bs * gen_len)/avg_time
@@ -796,7 +807,7 @@ if __name__ == "__main__":
                         f"[benchmark] bs={bs} | "
                         f"time={avg_time:.4f}s | "
                         f"throughput={toks_per_sec:.2f} tok/s"
-                    )
+                        + (f" | mem={peak_mem:.1f} MB" if peak_mem is not None else ""))
 
                 except RuntimeError as e:
                     if "out of memory" in str(e).lower():
