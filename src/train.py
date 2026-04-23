@@ -446,7 +446,7 @@ if __name__ == "__main__":
     eval_parser.add_argument("--benchmark_warmup", type=int, default=2)
 
     args = parser.parse_args()
-
+    print(args)
 
     if args.command == "preprocess":
         preprocess(args)
@@ -707,7 +707,9 @@ if __name__ == "__main__":
         os.makedirs("temp/", exist_ok=True)
 
         artifact.download("temp/")
+        print("Artifact downloaded")
         model.load_state_dict(torch.load("temp/best_model.pt", map_location=device))
+        print("Checkpoint loaded")
         base_model = model.module
         base_model.eval()
 
@@ -717,14 +719,14 @@ if __name__ == "__main__":
             elif device.type == "mps":
                 torch.mps.synchronize()
 
-    def reset_peak_memory(device):
-        if device.type == "cuda":
-            torch.cuda.reset_peak_memory_stats()
+        def reset_peak_memory(device):
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
 
-    def get_peak_memory_mb(device):
-        if device.type == "cuda":
-            return torch.cuda.max_memory_allocated() / (1024 ** 2)
-        return None
+        def get_peak_memory_mb(device):
+            if device.type == "cuda":
+                return torch.cuda.max_memory_allocated() / (1024 ** 2)
+            return None
 
         def time_forward_pass(fn, device, warmup=5, repeats=10):
             with torch.inference_mode():
@@ -817,6 +819,8 @@ if __name__ == "__main__":
 
             return results
 
+        print("About to check benchmark flag")
+        print("run_benchmark =", args.run_benchmark)
         if args.run_benchmark:
             print("\nRunning inference throughput benchmark...")
             benchmark_results = run_throughput_benchmark(
