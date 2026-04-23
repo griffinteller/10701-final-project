@@ -53,7 +53,7 @@ class SSMTranslator(nn.Module):
 
         self.D = nn.Linear(config.decoder_d_model, config.decoder_vocab_size)
 
-    def encode(self, ids: torch.Tensor, pad_id: int = 0) -> list[torch.Tensor]:
+    def encode(self, ids: torch.Tensor, pad_id: int = 0, first_layer_only: bool = False) -> list[torch.Tensor]:
         # find first pad ids
         first_pad_ids = (ids == pad_id).long().argmax(dim=-1)
 
@@ -67,6 +67,9 @@ class SSMTranslator(nn.Module):
             if result.Y is not None:  # skips last layer
                 y = result.Y + y
             hs.append(result.H_T)
+
+            if first_layer_only:
+                break
 
         for i, (h, lin) in enumerate(zip(hs, self.lin_EDs)):
             hs[i] = lin(h)
@@ -90,16 +93,17 @@ class SSMTranslator(nn.Module):
         
         pad_mask = torch.tensor([False for i in range(B)]).to(hs[0].device)
 
-        # match bug in teacher forcing
-        hs = [hs[0] for _ in range(len(self.decoder_layers))]
+        if len(hs) == 1:
+            # we only used first encoder layer
+            hs = hs * len(self.decoder_layers)
 
         for t in range(max_output_len):
             y = self.E(last_id).unsqueeze(1)  # B x (T = 1) x D
 
-            for i, (h, cache, decoder) in enumerate(zip(hs, XBC_caches, self.decoder_layers)):
+            for i, (cache, decoder) in enumerate(zip(XBC_caches, self.decoder_layers)):
                 result: Mamba2LayerResult = decoder(
                     inp=y, 
-                    H_n1=h, 
+                    H_n1=hs[i], 
                     XBC_cache=cache,
                     mode="linear"
                 )
@@ -131,10 +135,14 @@ class SSMTranslator(nn.Module):
 
         inp = self.E(inp)
 
-        for decoder in self.decoder_layers:
+        if len(hs) == 1:
+            # we only used first encoder layer
+            hs = hs * len(self.decoder_layers)
+
+        for i, decoder in enumerate(self.decoder_layers):
             result: Mamba2LayerResult = decoder(
                 inp=inp, 
-                H_n1=hs[0], 
+                H_n1=hs[i], 
                 XBC_cache=None,
                 mode="quadratic"
             )
@@ -151,9 +159,10 @@ class SSMTranslator(nn.Module):
         pad_id: int = 0,
         bos_id: int = 1,
         eos_id: int = 2,
+        first_encoder_layer_only: bool = False
     ) -> torch.Tensor:  # logits
         
-        hs = self.encode(inp_ids)
+        hs = self.encode(inp_ids, first_layer_only=first_encoder_layer_only)
 
         if decode_method == "ag":
             return self.decode_autoregressive(

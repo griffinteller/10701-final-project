@@ -1,8 +1,6 @@
 import pandas as pd
 import sentencepiece as sp
-import argparse
 import os
-import io
 
 
 if __name__ == "__main__":

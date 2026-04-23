@@ -32,6 +32,7 @@ python src/train.py preprocess
       ```
       python src/train.py train --train_config configs/<my_train_config>.yaml --model_config configs/<my_model_config>.csv --model <ssm | transformer | lstm>
       ```
+
     To train, you must make a wandb account for logging, and be added to the project organization (contact Griffin).
 
 `tests/`: pytests
@@ -39,7 +40,7 @@ python src/train.py preprocess
   - Training config schema:
   ```python
   class TrainConfig:
-    lr: int
+    lr: int | dict  # may provide adaptive, step, or exponential scheduler parameters (more details in train.py)
     num_epochs: int
     verbose: bool
     train_val_split: float
